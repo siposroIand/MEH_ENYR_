@@ -1,0 +1,14 @@
+from pathlib import Path
+
+MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024
+MAX_TOTAL_ATTACHMENTS_PER_RECORD = 500 * 1024 * 1024
+FORBIDDEN_EXTENSIONS = {".exe", ".bat", ".cmd", ".msi", ".sh", ".py", ".js", ".jar"}
+
+BACKUP_KEEP = 20
+BACKUP_AUTO_ENABLE = False
+BACKUP_INTERVAL_HOURS = 24
+
+DB_RETRY_MAX = 8
+LOG_LEVEL = "INFO"
+
+DEFAULT_EXPORT_DIR = Path.home()
