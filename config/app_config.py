@@ -2,7 +2,14 @@ from pathlib import Path
 from typing import Dict, List
 
 # hálózati gyökér (szerkeszthető) 
+<<<<<<< Updated upstream
 NETWORK_ROOT = Path(r"M:\home\IT apps\MEH_Programok\MEH_Engedelynyilvantarto\#adatbazis")
+=======
+NETWORK_ROOT = Path(os.environ.get(
+    "MEH_DATA_ROOT",
+    r"C:\Users\mails\SynologyDrive\IT apps\MEH_Programok\MEH_Engedelynyilvantarto\#adatbazis",
+))
+>>>>>>> Stashed changes
 
 APP_NAME = "MEH - Engedely Nyilvantarto Rendszer"
 DB_FILENAME = "engedelyek.db"
