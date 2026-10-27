@@ -18,12 +18,12 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.units import cm
 import os
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, List
-import json
+from xml.sax.saxutils import escape
 
 from config.app_config import get_ordered_categories
-from utils.dates import compute_review_date
+from utils.reviews import review_entries as _extract_review_entries
 
 
 def footer_only(canvas, doc):
@@ -59,81 +59,6 @@ def _format_hatya(e: dict) -> str:
     if ht == "indefinite" or (not ht and e.get("hatarozatlan")):
         return "Határozatlan"
     return "Változtatásig"
-
-
-def _extract_review_entries(e: dict) -> List[tuple]:
-    """
-    Return list of (dateobj, note) sorted, unique by date.
-    Fallback order: felulvizsgalatok (JSON/list) -> felulvizsgalat_date -> computed from nap -> compute_review_date
-    """
-    entries: List[tuple] = []
-    raw = e.get("felulvizsgalatok")
-    if raw:
-        try:
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(parsed, list):
-                for it in parsed:
-                    if isinstance(it, dict):
-                        d = it.get("date")
-                        note = (it.get("note") or "").strip()
-                        if d:
-                            try:
-                                dd = datetime.fromisoformat(d).date()
-                                entries.append((dd, note))
-                            except Exception:
-                                try:
-                                    dd = datetime.strptime(str(d), "%Y-%m-%d").date()
-                                    entries.append((dd, note))
-                                except Exception:
-                                    continue
-        except Exception:
-            entries = []
-
-    if not entries:
-        fv_single = e.get("felulvizsgalat_date")
-        if fv_single:
-            try:
-                dd = datetime.fromisoformat(fv_single).date()
-                entries.append((dd, ""))
-            except Exception:
-                try:
-                    dd = datetime.strptime(str(fv_single), "%Y-%m-%d").date()
-                    entries.append((dd, ""))
-                except Exception:
-                    pass
-
-    if not entries:
-        try:
-            fv_nap = int(e.get("felulvizsgalat_nap") or 0)
-        except Exception:
-            fv_nap = 0
-        lej = e.get("lejarat")
-        if fv_nap > 0 and lej:
-            try:
-                ld = datetime.fromisoformat(lej).date()
-            except Exception:
-                try:
-                    ld = datetime.strptime(str(lej), "%Y-%m-%d").date()
-                except Exception:
-                    ld = None
-            if ld:
-                comp = ld - timedelta(days=fv_nap)
-                entries.append((comp, f"{fv_nap} nappal a lejárat előtt (számított)"))
-
-    if not entries:
-        try:
-            fv = compute_review_date(e)
-            if fv:
-                entries.append((fv, ""))
-        except Exception:
-            pass
-
-    unique = {}
-    for dt, note in entries:
-        key = dt.isoformat()
-        if key not in unique:
-            unique[key] = (dt, note or "")
-    return [unique[k] for k in sorted(unique.keys())]
 
 
 # ----------------- Badge Flowable -----------------
@@ -204,7 +129,7 @@ def _review_block_html(e: dict, date_format: str = "%Y.%m.%d") -> str:
     for dt, note in entries:
         ds = dt.strftime(date_format)
         if note:
-            lines.append(f"<strong>{ds}</strong>: {note}")
+            lines.append(f"<strong>{ds}</strong>: {escape(note)}")
         else:
             lines.append(f"<strong>{ds}</strong>")
     return "<br/>".join(lines)
@@ -272,7 +197,7 @@ def export_groups_pdf(path: str, groups: Dict[str, List[dict]], telephely_map: D
             items = prefilter(items)
 
         if custom_title:
-            title_par = Paragraph(custom_title, styles["title"])
+            title_par = Paragraph(escape(custom_title), styles["title"])
         else:
             if mode == "telephely":
                 title_par = Paragraph(f"MÉH Zrt. – {key.upper()} TELEPHELYÉNEK ENGEDÉLYEI", styles["title"])
@@ -315,7 +240,8 @@ def export_groups_pdf(path: str, groups: Dict[str, List[dict]], telephely_map: D
             Paragraph("Kibocsátó hatóság", styles["h"]),
             Paragraph("Határozat száma", styles["h"]),
             Paragraph("Hatályos", styles["h"]),
-            Paragraph("Megjegyzés", styles["h"])
+            Paragraph("Megjegyzés", styles["h"]),
+            Paragraph("Felelős", styles["h"]),
         ]
         table_data = [header]
 
@@ -327,7 +253,7 @@ def export_groups_pdf(path: str, groups: Dict[str, List[dict]], telephely_map: D
 
         items_sorted = sorted(items, key=_sort_key)
         # desired widths for main table columns (before scaling)
-        desired_col_w = [4.0*cm, 6.0*cm, 4.5*cm, 4.5*cm, 2.5*cm, 10.0*cm]
+        desired_col_w = [4.0*cm, 6.0*cm, 4.5*cm, 4.5*cm, 2.5*cm, 10.0*cm, 3.0*cm]
         total_desired = sum(desired_col_w)
         if total_desired > page_w:
             scale = page_w / total_desired
@@ -340,7 +266,7 @@ def export_groups_pdf(path: str, groups: Dict[str, List[dict]], telephely_map: D
             hataly_display = _format_hatya(e)
 
             fv_block_html = _review_block_html(e, date_format)
-            base_megj = e.get("megjegyzes", "") or ""
+            base_megj = escape(e.get("megjegyzes", "") or "")
             if fv_block_html:
                 # create Badge with slightly larger font/padding for visual parity
                 b = Badge("FELÜLVIZSGÁLAT(OK):", bgcolor=HexColor("#70D925"), textColor=colors.black,
@@ -388,29 +314,31 @@ def export_groups_pdf(path: str, groups: Dict[str, List[dict]], telephely_map: D
                 for k, lbl in [("hulladek_nv_elokez", "NV-Elő"), ("hulladek_v_elokez", "V-Elő"),
                                ("hulladek_nv_gyujt", "NV-Gyűjt"), ("hulladek_v_gyujt", "V-Gyűjt")]:
                     if e.get(k):
-                        parts.append(f"{lbl}: {e[k]}")
+                        parts.append(f"{lbl}: {escape(str(e[k]))}")
                 if parts:
                     extra = "[" + ", ".join(parts) + "]"
                     if isinstance(megj_cell, Paragraph):
-                        text_html = ( (e.get("megjegyzes") or "").replace("\n","<br/>") + "<br/>" + extra ) if e.get("megjegyzes") else extra
+                        text_html = (base_megj.replace("\n", "<br/>") + "<br/>" + extra) if base_megj else extra
                         megj_cell = Paragraph(text_html, styles["c"])
                     else:
-                        pass
+                        megj_cell = Table([[megj_cell], [Paragraph(extra, styles["c"])]],
+                                          colWidths=[main_col_w[5]], hAlign="LEFT")
 
-            hat_text = (e.get("hatarozatszam") or "").replace("\n", " ")
+            hat_text = escape(e.get("hatarozatszam") or "").replace("\n", " ")
             mh = (e.get("modosito_hat") or "").strip()
             if mh:
                 parts = [p.strip() for p in mh.split(";") if p.strip()]
                 for p in parts:
-                    hat_text += "<br/><u><strong>mód.:</strong></u> " + p
+                    hat_text += "<br/><u><strong>mód.:</strong></u> " + escape(p)
 
             table_data.append([
-                Paragraph(e.get("kategoria") if mode == "telephely" else tp_name, styles["c"]),
-                Paragraph(e.get("engedely_nev", "") or "", styles["c"]),
-                Paragraph(e.get("kiado_hatosag", "") or "", styles["c"]),
+                Paragraph(escape((e.get("kategoria") if mode == "telephely" else tp_name) or ""), styles["c"]),
+                Paragraph(escape(e.get("engedely_nev", "") or ""), styles["c"]),
+                Paragraph(escape(e.get("kiado_hatosag", "") or ""), styles["c"]),
                 Paragraph(hat_text or "", styles["c"]),
                 Paragraph(hataly_display or "", styles["c"]),
                 megj_cell,
+                Paragraph(escape(e.get("responsible_name") or ""), styles["c"]),
             ])
 
         t = Table(table_data, colWidths=main_col_w, repeatRows=1)

@@ -1,11 +1,13 @@
 from typing import List, Dict, Any, Optional, Union
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import os
 import logging
 import re
 import math
-import json
+from xml.sax.saxutils import escape
+
+from utils.reviews import review_entries as _extract_review_entries
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ ALL_COLUMNS = [
     ("letrejott", "Létrejött"),
     ("lejarat", "Hatálya"),
     ("felulvizsgalat", "Felülvizsgálat"),
+    ("responsible_name", "Felelős"),
     ("megjegyzes", "Megjegyzés"),
     ("hulladek_nv_elokez", "NV-Előkezelés"),
     ("hulladek_v_elokez", "V-Előkezelés"),
@@ -50,6 +53,11 @@ ALL_COLUMNS = [
     ("hulladek_v_gyujt", "V-Gyűjtés"),
 ]
 KEY_TO_HEADER = {k: h for k, h in ALL_COLUMNS}
+
+def _export_columns(columns):
+    """Only public permit columns may be selected for an export."""
+    allowed = [key for key in columns if key in KEY_TO_HEADER or key == "lejarat_display"]
+    return allowed or ["telephely", "kategoria", "engedely_nev"]
 
 # ----------------- Helper functions -----------------
 def _register_fonts():
@@ -148,81 +156,14 @@ def _render_str(v: Any) -> str:
     except Exception:
         return ""
 
-def _extract_review_entries(e: dict) -> List[tuple]:
-    """
-    Shared extractor used by report_builder exporter.
-    """
-    entries: List[tuple] = []
-    raw = e.get("felulvizsgalatok")
-    if raw:
-        try:
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(parsed, list):
-                for it in parsed:
-                    if isinstance(it, dict):
-                        d = it.get("date")
-                        note = (it.get("note") or "").strip()
-                        if d:
-                            try:
-                                dd = datetime.fromisoformat(d).date()
-                                entries.append((dd, note))
-                            except Exception:
-                                try:
-                                    dd = datetime.strptime(str(d), "%Y.%m.%d").date()
-                                    entries.append((dd, note))
-                                except Exception:
-                                    continue
-        except Exception:
-            entries = []
-
-    if not entries:
-        fv_single = e.get("felulvizsgalat_date")
-        if fv_single:
-            try:
-                dd = datetime.fromisoformat(fv_single).date()
-                entries.append((dd, ""))
-            except Exception:
-                try:
-                    dd = datetime.strptime(str(fv_single), "%Y.%m.%d").date()
-                    entries.append((dd, ""))
-                except Exception:
-                    pass
-
-    if not entries:
-        try:
-            fv_nap = int(e.get("felulvizsgalat_nap") or 0)
-        except Exception:
-            fv_nap = 0
-        lejarat = e.get("lejarat")
-        if fv_nap > 0 and lejarat:
-            try:
-                ld = datetime.strptime(lejarat, "%Y.%m.%d").date()
-                comp = ld - timedelta(days=fv_nap)
-                entries.append((comp, f"{fv_nap} nappal a lejárat előtt (számított)"))
-            except Exception:
-                pass
-
-    if not entries:
-        try:
-            from utils import compute_review_date
-            fv = compute_review_date(e)
-            if fv:
-                entries.append((fv, ""))
-        except Exception:
-            pass
-
-    unique = {}
-    for dt, note in entries:
-        key = dt.isoformat()
-        if key not in unique:
-            unique[key] = (dt, note or "")
-    return [unique[k] for k in sorted(unique.keys())]
-
 def _format_review_dates_only(e: dict, date_format: str = "%Y.%m.%d") -> str:
     entries = _extract_review_entries(e)
     if not entries:
         return ""
-    return "\n".join(dt.strftime(date_format) for dt, _ in entries)
+    return "\n".join(
+        f"{dt.strftime(date_format)}: {note}" if note else dt.strftime(date_format)
+        for dt, note in entries
+    )
 
 def _format_review_block(e: dict, date_format: str = "%Y.%m.%d", for_pdf: bool = False) -> str:
     entries = _extract_review_entries(e)
@@ -233,7 +174,7 @@ def _format_review_block(e: dict, date_format: str = "%Y.%m.%d", for_pdf: bool =
         for dt, note in entries:
             ds = dt.strftime(date_format)
             if note:
-                lines.append(f"<strong>{ds}</strong>: {note}")
+                lines.append(f"<strong>{ds}</strong>: {escape(note)}")
             else:
                 lines.append(f"<strong>{ds}</strong>")
         return "FELÜLVIZSGÁLATOK:<br/>" + "<br/>".join(lines)
@@ -254,11 +195,13 @@ def _prepare_row(e: dict, tp_map: Dict[Any,str], columns: List[str], include_was
     Special handling:
      - 'modosito_hat': if contains ';' then replace with newline for proper wrapping.
      - 'lejarat'/'lejarat_display': always show the original full date (YYYY.MM.DD) if present.
-     - 'felulvizsgalat': return dates only (multiline).
+     - 'felulvizsgalat': dates and their original notes, one review per line.
      - 'megjegyzes': append FELÜLVIZSGÁLATOK block (multiline). For PDF the caller will convert '\n' to '<br/>'.
     """
     row = {}
     for key in columns:
+        if key not in KEY_TO_HEADER and key != "lejarat_display":
+            continue
         if key == "telephely":
             val = tp_map.get(e.get("telephely_id"))
             row[key] = _none_to_empty(val)
@@ -308,7 +251,6 @@ def _prepare_row(e: dict, tp_map: Dict[Any,str], columns: List[str], include_was
                     mg = (mg + "\n" if mg else "") + "[" + ", ".join(parts) + "]"
             row[key] = mg
         elif key == "felulvizsgalat":
-            # dates only, multiline
             row[key] = _format_review_dates_only(e, "%Y.%m.%d")
         else:
             row[key] = _none_to_empty(e.get(key))
@@ -319,6 +261,7 @@ def _prune_empty_columns(items: List[Dict[str, Any]], columns: List[str], tp_map
     Remove columns that are empty for ALL items in the group. Preserve some essential columns.
     Only considers None/empty-string as empty.
     """
+    columns = _export_columns(columns)
     if not items:
         return [c for c in columns]
     essential = {"telephely", "kategoria", "engedely_nev"}
@@ -335,7 +278,7 @@ def _prune_empty_columns(items: List[Dict[str, Any]], columns: List[str], tp_map
                 break
         if has_value:
             result.append(col)
-    return result
+    return result or columns
 
 # (a fájl többi része változatlan, a PDF útvonalon a _format_review_block(..., for_pdf=True) használható a megjegyzés HTML előállításához)
 def build_header_context(
@@ -471,7 +414,7 @@ def export_report_pdf(
                 val = r.get(k, "")
                 cell_text = _render_str(val)
                 col_texts[k].append(cell_text)
-                row_cells.append(Paragraph(cell_text.replace("\n","<br/>"), styles["c"]))
+                row_cells.append(Paragraph(escape(cell_text).replace("\n","<br/>"), styles["c"]))
             table_data.append(row_cells)
 
         page_w = landscape(A4)[0] - doc.leftMargin - doc.rightMargin
@@ -560,6 +503,7 @@ def export_report_excel(
             if not items:
                 # create empty sheet with requested headers
                 cols = (columns if isinstance(columns, list) else (columns.get(gname, list(KEY_TO_HEADER.keys())) if isinstance(columns, dict) else list(KEY_TO_HEADER.keys())))
+                cols = _export_columns(cols)
                 df = pd.DataFrame(columns=[KEY_TO_HEADER.get(k,k) for k in cols])
                 sheet_name = (_render_str(gname)[:31]) if gname else "Üres"
                 df.to_excel(writer, sheet_name=sheet_name, index=False)

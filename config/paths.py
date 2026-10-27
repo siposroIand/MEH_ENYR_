@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-import time
+import tempfile
 from pathlib import Path
 from typing import Dict
 
@@ -43,11 +43,13 @@ def get_resource_path(relative_path: str) -> Path:
 def get_app_root(network_root: Path | None = None, raise_on_fail: bool = False) -> Path:
     if network_root:
         try:
+            if not Path(network_root).expanduser().is_absolute():
+                raise ValueError("Az adatkönyvtárnak abszolút útvonalnak kell lennie.")
             candidate = Path(network_root).expanduser().resolve()
-            candidate.mkdir(parents=True, exist_ok=True)
-            test_file = candidate / f".writetest_{int(time.time())}"
-            test_file.write_text("ok", encoding="utf-8")
-            test_file.unlink(missing_ok=True)
+            if not candidate.is_dir():
+                raise FileNotFoundError("Az adatgyökér nem létezik; hozza létre az üzemeltető.")
+            with tempfile.TemporaryFile(dir=candidate) as probe:
+                probe.write(b"ok")
             return candidate
         except Exception:
             if raise_on_fail:
@@ -67,10 +69,7 @@ def get_app_root(network_root: Path | None = None, raise_on_fail: bool = False) 
 
 def ensure_dirs(dirs: Dict[str, Path]) -> None:
     for p in dirs.values():
-        try:
-            Path(p).mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        Path(p).mkdir(parents=True, exist_ok=True)
 
 
 def build_app_dirs(network_root: Path | None) -> Dict[str, Path]:

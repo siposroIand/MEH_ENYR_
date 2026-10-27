@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import Optional, Dict, Any
+
+from utils.reviews import compute_review_date as _compute_review_date
 
 
 def parse_iso_date(s: Optional[str]) -> Optional[date]:
@@ -23,35 +25,5 @@ def is_indefinite_lejarat(lejarat_str: Optional[str]) -> bool:
 
 
 def compute_review_date(entity: Dict[str, Any]) -> Optional[date]:
-    fv_str = entity.get("felulvizsgalat_date")
-    fv = parse_iso_date(fv_str)
-    if fv:
-        return fv
-
-    try:
-        fv_nap = int(entity.get("felulvizsgalat_nap") or 0)
-    except Exception:
-        fv_nap = 0
-
-    hataly_tipus = (entity.get("hataly_tipus") or "").strip().lower()
-    hatarozatlan_flag = bool(
-        int(entity.get("hatarozatlan") or 0)
-        if entity.get("hatarozatlan") is not None
-        else False
-    )
-
-    lejarat_raw = entity.get("lejarat")
-    lejarat = parse_iso_date(lejarat_raw)
-    if lejarat and is_indefinite_lejarat(lejarat_raw):
-        lejarat = None
-
-    if fv_nap > 0 and lejarat:
-        try:
-            return lejarat - timedelta(days=fv_nap)
-        except Exception:
-            return None
-
-    if hatarozatlan_flag or hataly_tipus == "indefinite":
-        return None
-
-    return None
+    """Compatibility entry point for the shared typed/legacy review parser."""
+    return _compute_review_date(entity)

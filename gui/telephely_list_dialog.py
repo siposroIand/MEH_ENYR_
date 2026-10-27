@@ -1,166 +1,91 @@
-import logging
-from uuid import uuid4
-from typing import List
-
-from PySide6.QtWidgets import (
-    QDialog,
-    QVBoxLayout,
-    QHBoxLayout,
-    QListWidget,
-    QPushButton,
-    QListWidgetItem,
-    QMessageBox,
-)
+"""Site management through the authenticated domain service."""
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QPushButton,
+    QListWidgetItem, QMessageBox,
+)
 
 from .telephely_dialog import TelephelyDialog
 
 
-
-logger = logging.getLogger("engedely_nyilvantarto")
-
-
 class TelephelyListDialog(QDialog):
-    """
-    Dialog telephelyek kezelésére.
-    Konstruktor: TelephelyListDialog(db, parent=None)
-      - db: az alkalmazás Database objektuma (várja, hogy legyen get_telephelyek() és get_connection())
-    """
-
-    def __init__(self, db, parent=None):
+    def __init__(self, service, parent=None):
         super().__init__(parent)
-        self.db = db
+        self.service = service
         self.setWindowTitle("Telephelyek kezelése")
         self.resize(560, 420)
-
         layout = QVBoxLayout(self)
-
-        # lista
         self.listw = QListWidget()
         self.listw.setSelectionMode(QListWidget.SingleSelection)
         layout.addWidget(self.listw)
-
-        # gombok
-        btns = QHBoxLayout()
-        self.btn_new = QPushButton("Hozzáadás")
-        self.btn_edit = QPushButton("Módosítás")
-        self.btn_delete = QPushButton("Törlés")
-        self.btn_close = QPushButton("Bezár")
-
-        btns.addWidget(self.btn_new)
-        btns.addWidget(self.btn_edit)
-        btns.addWidget(self.btn_delete)
-        btns.addStretch()
-        btns.addWidget(self.btn_close)
-        layout.addLayout(btns)
-
-        # csatlakoztatás
-        self.btn_new.clicked.connect(self.new_telephely)
-        self.btn_edit.clicked.connect(self.edit_selected)
-        self.btn_delete.clicked.connect(self.delete_selected)
-        self.btn_close.clicked.connect(self.accept)
-
-        # feltöltés
+        buttons = QHBoxLayout()
+        for name, title, slot in (
+            ("btn_new", "Hozzáadás", self.new_telephely),
+            ("btn_edit", "Módosítás", self.edit_selected),
+            ("btn_delete", "Törlés", self.delete_selected),
+            ("btn_close", "Bezár", self.accept),
+        ):
+            button = QPushButton(title)
+            setattr(self, name, button)
+            button.clicked.connect(slot)
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
         self.refresh_list()
 
     def refresh_list(self):
-        """Betölti a telephelyeket a DB-ből, szűr a kereső alapján, és megjeleníti a listában."""
-        self.listw.clear()
-        tps: List[dict] = []
+        selected = self.listw.currentItem()
+        selected_id = selected.data(Qt.UserRole)["id"] if selected else None
         try:
-            tps = self.db.get_telephelyek()
-        except Exception:
-            logger.exception("get_telephelyek failed")
-            # lehetőség: üzenet a felhasználónak, de itt csak üres lista jön ha hiba.
-        for t in sorted(tps, key=lambda x: (x.get("nev") or "").lower()):
-            name = t.get("nev", "Ismeretlen")
-            ktj = t.get("ktj")
-            # Megjelenítés: Telephely (KTJ) ha KTJ van
-            display = f"{name} | KTJ: {ktj}" if ktj else name
-
-            item = QListWidgetItem(display)
-            item.setData(Qt.UserRole, t)
+            sites = self.service.snapshot()["telephelyek"]
+        except Exception as exc:
+            QMessageBox.critical(self, "Frissítés sikertelen", str(exc))
+            return
+        self.listw.clear()
+        for site in sorted(sites, key=lambda row: (row.get("nev") or "").casefold()):
+            text = site.get("nev") or "Ismeretlen"
+            if site.get("ktj"):
+                text += f" | KTJ: {site['ktj']}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, site)
             self.listw.addItem(item)
+            if site["id"] == selected_id:
+                self.listw.setCurrentItem(item)
 
-    def _safe_log(self, note: str):
-        """Próbálja meghívni a db.log_event-et ha van (nem kötelező)."""
-        fn = getattr(self.db, "log_event", None)
-        if callable(fn):
-            try:
-                fn(note)
-            except Exception:
-                logger.debug("telephely list dialog: log_event failed", exc_info=True)
+    def _save(self, dialog, site=None):
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            values = dialog.get_data()
+            if site:
+                values["id"] = site["id"]
+            self.service.save_site(values, expected_version=site["version"] if site else None)
+        except Exception as exc:
+            QMessageBox.critical(self, "Mentés sikertelen", str(exc))
+            return
+        self.refresh_list()
 
     def new_telephely(self):
-        """Új telephely létrehozása dialógussal és DB-be beszúrás."""
-        dlg = TelephelyDialog(self)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        d = dlg.get_data()
-        new_id = str(uuid4())
-        try:
-            with self.db.get_connection() as conn:
-                conn.execute("INSERT INTO telephelyek (id, nev, ktj, cim) VALUES (?,?,?,?)",
-                             (new_id, d["nev"], d["ktj"], d["cim"]))
-            self._safe_log("telephely_insert")
-        except Exception as e:
-            logger.exception("Telephely létrehozása sikertelen: %s", e)
-            QMessageBox.critical(self, "Hiba", f"Telephely létrehozása sikertelen: {e}")
-            return
-        self.refresh_list()
+        self._save(TelephelyDialog(self))
 
     def edit_selected(self):
-        """Kiválasztott telephely szerkesztése."""
-        sel = self.listw.currentItem()
-        if not sel:
-            QMessageBox.information(self, "Nincs kiválasztva", "Válasszon ki egy telephelyet a szerkesztéshez.")
-            return
-        t = sel.data(Qt.UserRole)
-        dlg = TelephelyDialog(self, telephely=t)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        d = dlg.get_data()
-        try:
-            with self.db.get_connection() as conn:
-                conn.execute("UPDATE telephelyek SET nev=?, ktj=?, cim=? WHERE id=?",
-                             (d["nev"], d["ktj"], d["cim"], t["id"]))
-            self._safe_log("telephely_update")
-        except Exception as e:
-            logger.exception("Telephely frissítése sikertelen: %s", e)
-            QMessageBox.critical(self, "Hiba", f"Telephely frissítése sikertelen: {e}")
-            return
-        self.refresh_list()
+        selected = self.listw.currentItem()
+        if selected:
+            site = selected.data(Qt.UserRole)
+            self._save(TelephelyDialog(self, telephely=site), site)
+        else:
+            QMessageBox.information(self, "Nincs kiválasztva", "Válasszon ki egy telephelyet.")
 
     def delete_selected(self):
-        """Kiválasztott telephely törlése (ellenőrzi, hogy vannak-e engedélyek hozzárendelve)."""
-        sel = self.listw.currentItem()
-        if not sel:
-            QMessageBox.information(self, "Nincs kiválasztva", "Válasszon ki egy telephelyet a törléshez.")
+        selected = self.listw.currentItem()
+        if not selected:
+            QMessageBox.information(self, "Nincs kiválasztva", "Válasszon ki egy telephelyet.")
             return
-        t = sel.data(Qt.UserRole)
-        # ellenőrzés: vannak-e engedélyek a telephelyhez (nem törölt állapotban)
+        site = selected.data(Qt.UserRole)
+        if QMessageBox.question(self, "Törlés", f"Tényleg törli a telephelyet?\n{site.get('nev')}") != QMessageBox.Yes:
+            return
         try:
-            with self.db.get_connection() as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(1) as c FROM engedelyek WHERE telephely_id=? AND (deleted IS NULL OR deleted=0)", (t["id"],))
-                row = cur.fetchone()
-                if row and row["c"] > 0:
-                    QMessageBox.warning(self, "Nem törölhető", "A telephelyhez engedélyek tartoznak — előbb törölje vagy áthelyezze azokat.")
-                    return
-        except Exception:
-            # ha ellenőrzés nem sikerült, ne engedjük automatikusan törölni, kérjünk megerősítést
-            pass
-
-        if QMessageBox.question(self, "Törlés megerősítése", f"Tényleg törli a telephelyet?\n{t.get('nev')}") != QMessageBox.Yes:
+            self.service.delete_site(site["id"], expected_version=site["version"])
+        except Exception as exc:
+            QMessageBox.critical(self, "Törlés sikertelen", str(exc))
             return
-
-        try:
-            with self.db.get_connection() as conn:
-                conn.execute("DELETE FROM telephelyek WHERE id=?", (t["id"],))
-            self._safe_log("telephely_delete")
-        except Exception as e:
-            logger.exception("Telephely törlése sikertelen: %s", e)
-            QMessageBox.critical(self, "Hiba", f"Telephely törlése sikertelen: {e}")
-            return
-
         self.refresh_list()
