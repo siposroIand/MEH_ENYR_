@@ -413,6 +413,102 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual([p for p in self.directory.iterdir() if p.name.endswith(".restore")], [])
 
     @unittest.skipIf(fcntl is None, "Offline recovery requires POSIX locks")
+    def test_offline_restore_revokes_sessions_versions_users_and_records_recovery_audit(self):
+        db = self.database()
+        with db.get_connection() as conn:
+            conn.execute("""
+                CREATE TABLE auth_sessions(
+                    token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+                    auth_version INTEGER NOT NULL, expires_at REAL NOT NULL)
+            """)
+            conn.execute("""
+                CREATE TABLE login_throttle(
+                    username TEXT PRIMARY KEY, failures INTEGER NOT NULL, window_start REAL NOT NULL)
+            """)
+            conn.execute("""
+                CREATE TABLE audit_log(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+                    actor_id TEXT, action TEXT NOT NULL, entity_id TEXT, details TEXT NOT NULL)
+            """)
+            conn.execute("""
+                INSERT INTO users(id,username,display_name,password_hash,role,active,auth_version)
+                VALUES('u','operator','Operator','unused','admin',1,5)
+            """)
+            conn.execute("INSERT INTO auth_sessions VALUES('legacy-session','u',5,9999999999)")
+        backup = db.make_backup()
+        db.close()
+        precopy = Database.restore_offline(
+            self.path, backup, precopy_dir=self.directory / "recovery", exclusive_local=True)
+        with sqlite3.connect(self.path) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM auth_sessions").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT auth_version FROM users").fetchone()[0], 6)
+            event = conn.execute(
+                "SELECT actor_id,action,entity_id,details FROM audit_log ORDER BY id DESC").fetchone()
+            self.assertEqual(event[:3], (None, "offline_restore", None))
+            self.assertEqual(json.loads(event[3]),
+                             {"trusted_os_recovery": True, "sessions_revoked": True})
+            self.assertIn("offline_restore", conn.execute(
+                "SELECT note FROM db_events ORDER BY id DESC").fetchone()[0])
+        for original in (backup, precopy):
+            with sqlite3.connect(original) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM auth_sessions").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT auth_version FROM users").fetchone()[0], 5)
+
+    @unittest.skipIf(fcntl is None, "Offline recovery requires POSIX locks")
+    def test_offline_restore_refuses_invalid_user_role(self):
+        db = self.database()
+        with db.get_connection() as conn:
+            conn.execute("INSERT INTO users(id,username,role,active) VALUES('u','operator','superadmin',1)")
+        backup = db.make_backup()
+        db.close()
+        original = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "szerep"):
+            Database.restore_offline(self.path, backup, precopy_dir=self.backups,
+                                     exclusive_local=True)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    @unittest.skipIf(fcntl is None, "Offline recovery requires POSIX locks")
+    def test_offline_restore_refuses_dangling_responsible_user(self):
+        db = self.database()
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("INSERT INTO engedelyek(id,responsible_user_id) VALUES('p','missing')")
+        backup = db.make_backup()
+        db.close()
+        original = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "felelős"):
+            Database.restore_offline(self.path, backup, precopy_dir=self.backups,
+                                     exclusive_local=True)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    @unittest.skipIf(fcntl is None, "Offline recovery requires POSIX locks")
+    def test_offline_restore_refuses_legacy_site_orphans(self):
+        db = self.database()
+        with sqlite3.connect(self.path) as conn:
+            conn.execute("INSERT INTO engedelyek(id,telephely_id) VALUES('p','missing')")
+        backup = db.make_backup()
+        db.close()
+        with self.assertRaisesRegex(ValueError, "idegenkulcs"):
+            Database.restore_offline(self.path, backup, precopy_dir=self.backups,
+                                     exclusive_local=True)
+
+    @unittest.skipIf(fcntl is None, "Offline recovery requires POSIX locks")
+    def test_offline_restore_refuses_malformed_optional_auth_table_shape(self):
+        db = self.database()
+        with db.get_connection() as conn:
+            conn.execute("""
+                CREATE TABLE auth_sessions(
+                    token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+                    auth_version INTEGER NOT NULL, expires_at REAL NOT NULL)
+            """)
+        backup = db.make_backup()
+        db.close()
+        original = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "hitelesítési séma"):
+            Database.restore_offline(self.path, backup, precopy_dir=self.backups,
+                                     exclusive_local=True)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    @unittest.skipIf(fcntl is None, "Offline recovery requires POSIX locks")
     def test_offline_restore_rejects_wrong_schema_without_touching_target(self):
         db = self.database()
         bad = self.directory / "wrong.db"

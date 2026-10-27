@@ -541,6 +541,10 @@ def export_report_excel(
             for row_idx in range(2, 2 + len(rows)):
                 for col_idx in range(1, len(effective_cols) + 1):
                     cell = ws.cell(row=row_idx, column=col_idx)
+                    if isinstance(cell.value, str):
+                        # Preserve literal text, including leading "=" from profiles.
+                        cell.data_type = "s"
+                        cell.hyperlink = None
                     # preserve existing value, but ensure wrap_text True
                     cell.alignment = Alignment(wrap_text=True, vertical="top")
 

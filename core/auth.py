@@ -48,12 +48,8 @@ def _password_bytes(password):
 def hash_password(password: str) -> str:
     raw = _password_bytes(password)
     salt = secrets.token_bytes(16)
-    try:
-        digest = hashlib.scrypt(raw, salt=salt, n=16384, r=8, p=1, dklen=32)
-        return f"v1$scrypt$16384$8$1${salt.hex()}${digest.hex()}"
-    except (ValueError, AttributeError):
-        digest = hashlib.pbkdf2_hmac("sha256", raw, salt, 600000)
-        return f"v1$pbkdf2_sha256$600000${salt.hex()}${digest.hex()}"
+    digest = hashlib.pbkdf2_hmac("sha256", raw, salt, 600000)
+    return f"v1$pbkdf2_sha256$600000${salt.hex()}${digest.hex()}"
 
 
 def verify_password(password: str, encoded: str) -> bool:
@@ -63,12 +59,13 @@ def verify_password(password: str, encoded: str) -> bool:
         parts = encoded.split("$")
         if parts[:2] == ["v1", "scrypt"] and len(parts) == 7:
             _, _, n, r, p, salt, expected = parts
-            if (n, r, p) != ("16384", "8", "1"):
+            if (n, r, p) != ("131072", "8", "1"):
                 return False
             salt, expected = bytes.fromhex(salt), bytes.fromhex(expected)
             if len(salt) != 16 or len(expected) != 32:
                 return False
-            actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=32)
+            actual = hashlib.scrypt(password.encode("utf-8"), salt=salt,
+                                    n=131072, r=8, p=1, dklen=32, maxmem=256 * 1024 * 1024)
         elif parts[:2] == ["v1", "pbkdf2_sha256"] and len(parts) == 5:
             _, _, iterations, salt, expected = parts
             if iterations != "600000":
@@ -216,23 +213,31 @@ class AuthService:
         return session
 
     def logout(self):
-        if self.session:
-            with transaction(self.db) as conn:
-                conn.execute("DELETE FROM auth_sessions WHERE token_hash=?",
-                             (hashlib.sha256(self.session.token.encode()).hexdigest(),))
-                audit(conn, self.session.user_id, "logout", self.session.user_id)
-        self.session = None
+        session = self.session
+        try:
+            if session:
+                with transaction(self.db) as conn:
+                    conn.execute("DELETE FROM auth_sessions WHERE token_hash=?",
+                                 (hashlib.sha256(session.token.encode()).hexdigest(),))
+                    audit(conn, session.user_id, "logout", session.user_id)
+        finally:
+            self.session = None
 
-    def change_password(self, old_password, new_password):
+    def change_password(self, old_password, new_password, display_name=None):
         encoded = hash_password(new_password)
+        if display_name is not None:
+            display_name = self._display_name(display_name)
         with transaction(self.db) as conn:
             user = self._current(conn)
             if not verify_password(old_password, user["password_hash"]):
                 raise AuthenticationError("A jelenlegi jelszó hibás.")
-            conn.execute("UPDATE users SET password_hash=?,auth_version=auth_version+1 WHERE id=?",
-                         (encoded, user["id"]))
+            conn.execute("""UPDATE users SET password_hash=?,display_name=?,
+                auth_version=auth_version+1 WHERE id=?""",
+                (encoded, display_name if display_name is not None else user["display_name"], user["id"]))
             conn.execute("DELETE FROM auth_sessions WHERE user_id=?", (user["id"],))
             audit(conn, user["id"], "password_changed", user["id"])
+            if display_name is not None:
+                audit(conn, user["id"], "profile_updated", user["id"])
         self.session = None
 
     def list_users(self):
@@ -286,6 +291,36 @@ class AuthService:
 
     def deactivate_user(self, user_id):
         return self.save_user({"id": user_id, "active": 0})
+
+    def bootstrap(self, username, display_name, password):
+        return self.bootstrap_admin(username, password, display_name)
+
+    def update_profile(self, display_name):
+        display_name = self._display_name(display_name)
+        with transaction(self.db) as conn:
+            user = self._current(conn)
+            conn.execute("UPDATE users SET display_name=? WHERE id=?", (display_name, user["id"]))
+            audit(conn, user["id"], "profile_updated", user["id"])
+            return public_user(conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone())
+
+    @staticmethod
+    def _display_name(display_name):
+        if not isinstance(display_name, str) or not display_name.strip() or len(display_name) > 256:
+            raise ValidationError("Érvényes megjelenítési név szükséges.")
+        return display_name.strip()
+
+    def create_user(self, username, display_name, password, role):
+        return self.save_user({"username": username, "display_name": display_name,
+                               "password": password, "role": role})
+
+    def update_user(self, user_id, display_name=None, role=None, active=None):
+        values = {"id": user_id}
+        values.update({key: value for key, value in
+                       (("display_name", display_name), ("role", role), ("active", active))
+                       if value is not None})
+        return self.save_user(values)
+
+    reset_password = change_user_password
 
 
 AuthorizationError = PermissionDenied

@@ -75,12 +75,15 @@ class PermitService(AuthService):
         super().__init__(db, session)
         self.auth = self
         self.attachments_root = Path(attachments_root) if attachments_root is not None else None
+        self._warnings = []
 
     def snapshot(self):
         with transaction(self.db) as conn:
             user = public_user(self._current(conn))
             permits = [dict(row) for row in conn.execute(
-                "SELECT * FROM engedelyek WHERE COALESCE(deleted,0)=0 ORDER BY id")]
+                """SELECT p.*,COALESCE(NULLIF(u.display_name,''),u.username,'') AS responsible_name
+                FROM engedelyek p LEFT JOIN users u ON u.id=p.responsible_user_id
+                WHERE COALESCE(p.deleted,0)=0 ORDER BY p.id""")]
             sites = [dict(row) for row in conn.execute("SELECT * FROM telephelyek ORDER BY nev,id")]
             users = [public_user(row) for row in conn.execute("SELECT * FROM users ORDER BY username")]
             return {"permits": permits, "sites": sites, "users": users, "current_user": user,
@@ -115,9 +118,9 @@ class PermitService(AuthService):
         if row is None or not row["active"] or row["role"] not in {"admin", "clerk"}:
             raise ValidationError("Csak aktív ügyintéző vagy adminisztrátor jelölhető ki.")
 
-    def _validate_permit(self, conn, values):
-        if not isinstance(values.get("engedely_nev"), str) or not values["engedely_nev"].strip():
-            raise ValidationError("Az engedély neve kötelező.")
+    def _validate_permit(self, conn, values, *, validate_reviews=True):
+        if not isinstance(values.get("kategoria"), str) or not values["kategoria"].strip():
+            raise ValidationError("Az engedélytípus kiválasztása kötelező.")
         for field in PERMIT_FIELDS - {"hatarozatlan", "archivalt", "felulvizsgalat_nap", "felulvizsgalatok"}:
             value = values.get(field)
             if value is not None and (not isinstance(value, str) or len(value) > 100000):
@@ -127,9 +130,13 @@ class PermitService(AuthService):
                 raise ValidationError(f"Érvénytelen logikai érték: {field}.")
             values[field] = int(bool(values.get(field)))
         for field in ("letrejott", "lejarat", "felulvizsgalat_date"):
+            if field == "felulvizsgalat_date" and not validate_reviews:
+                continue
             values[field] = _iso(values.get(field), field)
         days = values.get("felulvizsgalat_nap")
-        if days not in ("", None):
+        if not validate_reviews:
+            pass
+        elif days not in ("", None):
             if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= 36500:
                 raise ValidationError("Érvénytelen felülvizsgálati napszám.")
         else:
@@ -147,13 +154,14 @@ class PermitService(AuthService):
             values["hatarozatlan"], values["lejarat"] = 0, None
         else:
             values["hatarozatlan"] = 0
-        parsed = parse_reviews(values)
-        if not parsed.valid:
-            raise ValidationError("; ".join(parsed.errors))
-        reviews = normalize_reviews(list(parsed.entries))
-        if kind != "fixed" and any(item["type"] == "before_expiry" for item in reviews):
-            raise ValidationError("Lejárat előtti felülvizsgálat csak határozott hatályhoz adható.")
-        values["felulvizsgalatok"] = json.dumps(reviews, ensure_ascii=False)
+        if validate_reviews:
+            parsed = parse_reviews(values)
+            if not parsed.valid:
+                raise ValidationError("; ".join(parsed.errors))
+            reviews = normalize_reviews(list(parsed.entries))
+            if kind != "fixed" and any(item["type"] == "before_expiry" for item in reviews):
+                raise ValidationError("Lejárat előtti felülvizsgálat csak határozott hatályhoz adható.")
+            values["felulvizsgalatok"] = json.dumps(reviews, ensure_ascii=False)
         site_id = values.get("telephely_id")
         if not site_id or conn.execute("SELECT 1 FROM telephelyek WHERE id=?", (site_id,)).fetchone() is None:
             raise ValidationError("Létező telephely kiválasztása szükséges.")
@@ -162,7 +170,7 @@ class PermitService(AuthService):
     @staticmethod
     def _changes(values):
         values = dict(values)
-        extras = set(values) - PERMIT_FIELDS - {"id", "version", "last_modified", "deleted"}
+        extras = set(values) - PERMIT_FIELDS - {"id", "version", "last_modified", "deleted", "responsible_name"}
         if extras:
             raise ValidationError("Ismeretlen engedélymező: " + ", ".join(sorted(extras)))
         if values.get("deleted") not in (None, 0, False):
@@ -191,7 +199,11 @@ class PermitService(AuthService):
                 new["responsible_user_id"] = user["id"]
         if old is None or new.get("responsible_user_id") != old["responsible_user_id"]:
             self._assignee(conn, new.get("responsible_user_id"))
-        new = self._validate_permit(conn, new)
+        review_fields = {"felulvizsgalatok", "felulvizsgalat_nap", "felulvizsgalat_date",
+                         "lejarat", "hataly_tipus", "hatarozatlan"}
+        validate_reviews = old is None or any(
+            key in changes and changes[key] != old.get(key) for key in review_fields)
+        new = self._validate_permit(conn, new, validate_reviews=validate_reviews)
         new["last_modified"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         new["version"] = old["version"] + 1 if old else 1
         columns = sorted(new)
@@ -208,13 +220,18 @@ class PermitService(AuthService):
               {"before": before, "after": new})
         return self._permit(conn, permit_id)
 
-    def save_permit(self, values, expected_version=None, attachment_plan=None):
+    def save_permit(self, values, expected_version=None, attachment_plan=None, *, permit_id=None):
+        values = dict(values)
+        if permit_id is not None:
+            if values.get("id") not in (None, permit_id):
+                raise ValidationError("Ellentmondó engedélyazonosítók.")
+            values["id"] = permit_id
         if attachment_plan is not None:
             self._check_plan(attachment_plan)
         try:
             with transaction(self.db) as conn:
                 user = self._current(conn)
-                saved = self._save_permit(conn, user, dict(values), expected_version)
+                saved = self._save_permit(conn, user, values, expected_version)
                 if attachment_plan is not None and attachment_plan.has_changes:
                     attachment_plan.prepare(saved["id"])
                     audit(conn, user["id"], "attachments_changed", saved["id"])
@@ -224,6 +241,7 @@ class PermitService(AuthService):
             raise
         if attachment_plan is not None:
             attachment_plan.finalize()
+            self._warnings.extend(attachment_plan.cleanup_warnings)
         return saved
 
     @staticmethod
@@ -270,8 +288,12 @@ class PermitService(AuthService):
                 audit(conn, user["id"], "permit_deleted", permit_id, {"before": old})
         # Soft deletion intentionally preserves the permit's attachment directory.
 
-    def save_site(self, values, expected_version=None):
+    def save_site(self, values, expected_version=None, *, site_id=None):
         values = dict(values)
+        if site_id is not None:
+            if values.get("id") not in (None, site_id):
+                raise ValidationError("Ellentmondó telephelyazonosítók.")
+            values["id"] = site_id
         if set(values) - {"id", "nev", "ktj", "cim", "version"}:
             raise ValidationError("Ismeretlen telephelymező.")
         with transaction(self.db) as conn:
@@ -360,6 +382,17 @@ class PermitService(AuthService):
     def save_attachments(self, permit_id, attachment_plan, expected_version):
         return self.save_permit({"id": permit_id}, expected_version, attachment_plan)
 
+    def add_attachments(self, permit_id, paths, expected_version):
+        with self.attachment_plan(permit_id) as plan:
+            for path in paths:
+                plan.add(path)
+            return self.save_attachments(permit_id, plan, expected_version)
+
+    def archive_permits(self, ids, archived, expected_versions):
+        return self.bulk_update(ids, {"archivalt": archived}, expected_versions)
+
+    assign_permits = assign
+
     def list_backups(self):
         with transaction(self.db) as conn:
             self._current(conn, admin=True)
@@ -381,6 +414,12 @@ class PermitService(AuthService):
                 return self.db.restore_backup(backup_path)
             except RuntimeError as exc:
                 raise ValidationError(str(exc)) from exc
+
+    def take_warnings(self):
+        with transaction(self.db) as conn:
+            self._current(conn)
+            warnings, self._warnings = self._warnings, []
+            return warnings
 
 
 Service = PermitService

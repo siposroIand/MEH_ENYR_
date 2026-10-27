@@ -38,6 +38,7 @@ class FakeAuth:
 
     def change_password(self, old, new, **kwargs):
         self.calls.append(("password", old, new))
+        self.password_profile_name = kwargs.get("display_name")
         self.session = None
 
     def list_users(self):
@@ -102,9 +103,11 @@ class AuthDialogTests(unittest.TestCase):
         dialog.old.setText("old-test-value")
         dialog.new.setText("new-test-value")
         dialog.confirm.setText("new-test-value")
+        dialog.name.setText("Új profilnév")
         self.wait_finished(dialog, dialog._save)
         self.assertEqual(auth.calls[0][0], "password")
         self.assertIsNone(auth.session)
+        self.assertEqual(auth.password_profile_name, "Új profilnév")
 
     def test_user_table_never_displays_hash(self):
         dialog = UsersDialog(FakeAuth())

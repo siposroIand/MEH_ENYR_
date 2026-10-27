@@ -33,9 +33,8 @@ class PasswordTests(unittest.TestCase):
         self.assertFalse(verify_password(PASSWORD, "sha256$legacy"))
         self.assertFalse(verify_password(PASSWORD, first.replace("v1$", "v2$")))
 
-    def test_pbkdf2_fallback_and_malformed_hashes(self):
-        with patch("core.auth.hashlib.scrypt", side_effect=ValueError("not supported")):
-            encoded = hash_password(PASSWORD)
+    def test_pbkdf2_primary_and_malformed_hashes(self):
+        encoded = hash_password(PASSWORD)
         self.assertIn("$pbkdf2_sha256$600000$", encoded)
         self.assertTrue(verify_password(PASSWORD, encoded))
         self.assertFalse(verify_password(PASSWORD, encoded.replace("$600000$", "$999999999999$")))
@@ -45,6 +44,15 @@ class PasswordTests(unittest.TestCase):
             hash_password("short")
         with self.assertRaises(ValidationError):
             hash_password("a" * 1025)
+
+    def test_scrypt_verifier_requires_strong_bounded_parameters(self):
+        salt, expected = b"s" * 16, b"d" * 32
+        encoded = f"v1$scrypt$131072$8$1${salt.hex()}${expected.hex()}"
+        with patch("core.auth.hashlib.scrypt", return_value=expected) as scrypt:
+            self.assertTrue(verify_password(PASSWORD, encoded))
+            scrypt.assert_called_once_with(PASSWORD.encode(), salt=salt, n=131072,
+                                           r=8, p=1, dklen=32, maxmem=256 * 1024 * 1024)
+        self.assertFalse(verify_password(PASSWORD, encoded.replace("$131072$", "$16384$")))
 
     def test_verification_uses_constant_time_comparison(self):
         encoded = hash_password(PASSWORD)
@@ -79,6 +87,7 @@ class ServiceTests(unittest.TestCase):
     def permit(self, service=None, **changes):
         values = {
             "telephely_id": self.site["id"], "engedely_nev": "Próba",
+            "kategoria": "Levegőtisztaság-védelem",
             "hataly_tipus": "fixed", "lejarat": "2030-12-31",
             "felulvizsgalatok": [{"type": "before_expiry", "days": 0, "note": "Határnap"}],
         }
@@ -161,6 +170,12 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(AuthenticationError):
             clone.snapshot()
 
+    def test_logout_clears_local_session_even_when_database_unavailable(self):
+        with patch.object(self.db, "get_connection", side_effect=sqlite3.OperationalError("unavailable")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.clerk.logout()
+        self.assertIsNone(self.clerk.session)
+
     def test_password_change_revokes_every_session(self):
         clone = PermitService(self.db, self.clerk.session)
         with self.assertRaises(AuthenticationError):
@@ -172,6 +187,15 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(AuthenticationError):
             self.clerk.login("clerk", PASSWORD)
         self.clerk.login("clerk", "new valid password")
+
+    def test_password_and_profile_change_are_atomic(self):
+        with self.assertRaises(AuthenticationError):
+            self.clerk.change_password("wrong", "new valid password", display_name="Must not change")
+        self.assertEqual(self.clerk.current_user["display_name"], "Ügyintéző")
+        self.clerk.change_password(PASSWORD, "new valid password", display_name=" Changed together ")
+        self.assertIsNone(self.clerk.session)
+        self.clerk.login("clerk", "new valid password")
+        self.assertEqual(self.clerk.current_user["display_name"], "Changed together")
 
     def test_admin_reset_deactivation_and_role_change_revoke_sessions(self):
         self.admin.change_user_password(self.clerk_user["id"], "different valid password")
@@ -220,6 +244,8 @@ class ServiceTests(unittest.TestCase):
         other = self.permit()
         self.assertEqual(own["responsible_user_id"], self.clerk_user["id"])
         self.assertEqual(other["responsible_user_id"], self.admin_id)
+        snapshot_records = {row["id"]: row for row in self.admin.snapshot()["permits"]}
+        self.assertEqual(snapshot_records[own["id"]]["responsible_name"], "Ügyintéző")
         changed = self.clerk.save_permit({"id": own["id"], "megjegyzes": "Changed"}, own["version"])
         self.assertEqual(changed["version"], own["version"] + 1)
         with self.assertRaises(PermissionDenied):
@@ -289,7 +315,7 @@ class ServiceTests(unittest.TestCase):
 
     def test_validation_reviews_dates_and_no_injection(self):
         for changes in (
-            {"engedely_nev": ""}, {"telephely_id": "missing"},
+            {"kategoria": ""}, {"telephely_id": "missing"},
             {"lejarat": "2030-02-31"}, {"felulvizsgalatok": "invalid"},
             {"felulvizsgalatok": [{"type": "before_expiry", "days": -1}]},
             {"hataly_tipus": "indefinite"},
@@ -329,9 +355,46 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.admin.restore_backup(backup)
 
+    def test_gui_convenience_aliases_preserve_versions_and_permissions(self):
+        record = self.permit(self.clerk)
+        record = self.clerk.save_permit({"megjegyzes": "keyword ID"},
+                                       permit_id=record["id"], expected_version=record["version"])
+        record = self.clerk.archive_permits(
+            [record["id"]], True, {record["id"]: record["version"]})[0]
+        self.assertEqual(record["archivalt"], 1)
+        record = self.clerk.add_attachments(record["id"], [self.source()], record["version"])
+        self.assertEqual(self.clerk.list_attachments(record["id"]), ["document.pdf"])
+        record = self.admin.assign_permits(
+            [record["id"]], self.admin_id, {record["id"]: record["version"]})[0]
+        self.assertEqual(record["responsible_user_id"], self.admin_id)
+        site = self.admin.save_site({"nev": "keyword site ID"}, site_id=self.site["id"],
+                                    expected_version=self.site["version"])
+        self.assertEqual(site["nev"], "keyword site ID")
+
+    def test_auth_dialog_convenience_api_and_profile_updates(self):
+        session = self.clerk.session
+        user = self.clerk.update_profile(" Új név ")
+        self.assertEqual(user["display_name"], "Új név")
+        self.assertEqual(self.clerk.session, session)
+        self.assertEqual(self.clerk.current_user["display_name"], "Új név")
+        created = self.admin.create_user("NewUser", "New User", PASSWORD, "clerk")
+        updated = self.admin.update_user(created["id"], "Updated User", "viewer", 0)
+        self.assertEqual((updated["display_name"], updated["role"], updated["active"]),
+                         ("Updated User", "viewer", 0))
+        self.admin.reset_password(created["id"], "different valid password")
+        with self.assertRaises(ValidationError):
+            self.clerk.update_profile("")
+        with self.assertRaises(PermissionDenied):
+            self.clerk.create_user("Illegal", "Illegal", PASSWORD, "admin")
+        fresh_db = Database(self.directory / "bootstrap-alias.db", self.directory / "alias-backups")
+        auth = PermitService(fresh_db)
+        auth.bootstrap("First", "Első admin", PASSWORD)
+        self.assertEqual(auth.current_user["display_name"], "Első admin")
+
     def test_attachment_add_cancel_save_and_soft_delete(self):
         source = self.source()
         plan = self.clerk.attachment_plan()
+        self.assertEqual(Path(plan._temporary_directory.name).parent, self.root.absolute() / ".staging")
         plan.add(source)
         self.assertEqual(plan.list_names(), ["document.pdf"])
         self.assertTrue(plan.path_for("document.pdf").is_file())
@@ -341,6 +404,7 @@ class ServiceTests(unittest.TestCase):
         plan.add(source)
         record = self.clerk.save_permit({
             "telephely_id": self.site["id"], "engedely_nev": "With attachment",
+            "kategoria": "Levegőtisztaság-védelem",
         }, attachment_plan=plan)
         destination = self.clerk.attachment_path(record["id"], "document.pdf")
         self.assertEqual(destination.read_bytes(), source.read_bytes())

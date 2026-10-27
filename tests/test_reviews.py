@@ -89,6 +89,29 @@ class ReviewTests(unittest.TestCase):
             self.assertEqual(review_entries({"felulvizsgalat_date": value}), [
                 (date(2030, 1, 2), "")])
 
+    def test_untyped_days_are_relative_even_with_stale_calculated_date(self):
+        raw = [
+            {"days": 30, "note": "relative only"},
+            {"days": 0, "date": "1990-01-01", "note": "prefer explicit days"},
+        ]
+        entity = {"lejarat": "2030-03-01", "felulvizsgalatok": raw}
+        parsed = parse_reviews(entity)
+        self.assertTrue(parsed.valid)
+        self.assertIs(parsed.raw, raw)
+        self.assertEqual([entry["type"] for entry in parsed.entries], ["before_expiry"] * 2)
+        self.assertEqual(review_entries(entity), [
+            (date(2030, 1, 30), "relative only"),
+            (date(2030, 3, 1), "prefer explicit days")])
+        self.assertEqual(raw[1]["date"], "1990-01-01")
+
+    def test_calendar_underflow_has_hungarian_context_and_preserves_source(self):
+        raw = [{"days": 30, "note": "must not lose"}]
+        parsed = parse_reviews({"lejarat": "0001-01-01", "felulvizsgalatok": raw})
+        self.assertFalse(parsed.valid)
+        self.assertIs(parsed.raw, raw)
+        self.assertIn("1. felülvizsgálati bejegyzés", parsed.errors[0])
+        self.assertIn("naptári tartomány", parsed.errors[0])
+
 
 if __name__ == "__main__":
     unittest.main()

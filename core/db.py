@@ -16,6 +16,10 @@ SQLite exclusive lock, and only then publishes the closed replacement. Keep
 directory access revoked throughout; restore ACLs and restart clients afterward.
 Older clients with no lease and idle external SQLite connections cannot be
 detected reliably. If exclusivity cannot be guaranteed, do not restore.
+Recovery accepts only current-schema snapshots and rejects all foreign-key
+violations (including legacy orphans that normal migration preserves), invalid
+user roles and malformed optional authentication schemas. It revokes restored
+sessions, advances authentication versions, and records trusted OS recovery.
 
 Backups require same-filesystem hard-link publication; unsupported SMB/link
 implementations fail safely rather than fall back to overwriting a backup.
@@ -457,9 +461,50 @@ class Database:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?",
                             (name,)).fetchone() is None:
                 raise ValueError("Hiányos verziókezelés a visszaállítási forrásban.")
+        optional = {
+            "auth_sessions": {"token_hash": "TEXT", "user_id": "TEXT",
+                              "auth_version": "INTEGER", "expires_at": "REAL"},
+            "login_throttle": {"username": "TEXT", "failures": "INTEGER", "window_start": "REAL"},
+            "audit_log": {"id": "INTEGER", "ts": "REAL", "actor_id": "TEXT",
+                          "action": "TEXT", "entity_id": "TEXT", "details": "TEXT"},
+        }
+        for table, columns in optional.items():
+            definition = conn.execute("SELECT type FROM sqlite_master WHERE name=?", (table,)).fetchone()
+            if definition is None:
+                continue
+            actual = {row[1]: row[2].upper() for row in conn.execute(f"PRAGMA table_info({table})")}
+            if definition[0] != "table" or any(actual.get(name) != kind for name, kind in columns.items()):
+                raise ValueError("Érvénytelen hitelesítési séma: " + table)
+        if conn.execute("""
+            SELECT 1 FROM users WHERE role IS NULL OR role NOT IN ('admin','clerk','viewer')
+            OR active IS NULL OR active NOT IN (0,1)
+            OR typeof(auth_version) != 'integer' OR auth_version < 1 LIMIT 1
+        """).fetchone():
+            raise ValueError("Érvénytelen felhasználói szerep vagy hitelesítési állapot.")
+        if conn.execute("""
+            SELECT 1 FROM engedelyek e LEFT JOIN users u ON e.responsible_user_id=u.id
+            WHERE e.responsible_user_id IS NOT NULL AND u.id IS NULL LIMIT 1
+        """).fetchone():
+            raise ValueError("Nem létező felelős felhasználó a visszaállítási forrásban.")
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise ValueError("A visszaállítási forrás idegenkulcs-hibát tartalmaz; előbb javítsa offline másolaton.")
         revision = conn.execute("SELECT revision FROM database_revision WHERE id=1").fetchone()
         if revision is None or not isinstance(revision[0], int) or revision[0] < 0:
             raise ValueError("Érvénytelen adatbázis-revízió.")
+
+    @staticmethod
+    def _revoke_restored_auth(conn):
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "auth_sessions" in tables:
+            conn.execute("DELETE FROM auth_sessions")
+        conn.execute("UPDATE users SET auth_version=auth_version+1")
+        note = "offline_restore: trusted OS recovery; all restored sessions revoked"
+        conn.execute("INSERT INTO db_events(ts,note) VALUES(?,?)", (int(time.time()), note))
+        if "audit_log" in tables:
+            conn.execute("""
+                INSERT INTO audit_log(ts,actor_id,action,entity_id,details)
+                VALUES(?,NULL,'offline_restore',NULL,?)
+            """, (time.time(), json.dumps({"trusted_os_recovery": True, "sessions_revoked": True})))
 
     @classmethod
     def restore_offline(cls, db_path: Path, backup_path: Path, *,
@@ -513,6 +558,7 @@ class Database:
                 old_revision = row[0] if row else 0
                 with closing(sqlite3.connect(staging)) as conn:
                     with conn:
+                        cls._revoke_restored_auth(conn)
                         conn.execute("UPDATE database_revision SET revision=max(revision, ?)+1 WHERE id=1",
                                      (old_revision,))
                 target.commit()

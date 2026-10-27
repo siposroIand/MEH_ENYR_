@@ -310,6 +310,10 @@ def export_to_excel(path: str, items: List[dict], telephelyek: List[dict], optio
                 # Data cells: enable wrap_text and top alignment to preserve DB line breaks
                 for row_idx, c in enumerate(col, start=1):
                     try:
+                        if isinstance(c.value, str):
+                            # Permit/profile text must never become an Excel formula.
+                            c.data_type = "s"
+                            c.hyperlink = None
                         v = str(c.value) if c.value is not None else ""
                         if len(v) > max_len:
                             max_len = len(v)

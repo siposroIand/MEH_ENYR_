@@ -4,9 +4,25 @@ Magyar nyelvű Python/PySide6 asztali alkalmazás. A telephelyek, engedélykateg
 azonosítók, archívum, határidők, keresés és PDF/Excel/egyéni riportok megmaradnak.
 Az **engedélyügy felelőse** nem azonos a program használati jogosultságával.
 
+## Felépítés és egyszerűsítések
+
+- `core/db.py`: tárolási életciklus, tranzakciók, migrációk, revíziók és helyreállítás.
+- `core/auth.py`: hitelesítés, visszavonható munkamenetek és fiókszabályok.
+- `core/services.py`: a GUI által hívható, jogosultságellenőrzött ügy- és telephelyműveletek.
+- `utils/reviews.py`: közös felülvizsgálati értelmezés a képernyők és exportok számára.
+- `core/attachments.py`: közös fájlpolitika és visszavonható csatolmánytervezet.
+- `gui/`: a meglévő magyar táblázatos munkafolyamat; nincs közvetlen SQL-írás.
+
+Az új ügy a kiválasztott telephelyet/kategóriát ajánlja fel, a saját ügyek egy
+szűrővel elérhetők, és több ügy felelőse egyszerre kijelölhető. A hibás mentés
+nem üríti ki az űrlapot. A törlés és a tartós csatolmány eltávolítása továbbra is
+megerősítést kér; nem automatizálunk jogszabályi vagy hatósági döntést.
+
 ## Telepítés és indítás
 
 Python 3.10–3.13, működő grafikus környezet és a Qt rendszerkönyvtárai szükségesek.
+A rögzített függőségeket Python 3.12/Linux környezetben ellenőriztük;
+a Windows és más Python-verziók külön átvételi próbát igényelnek.
 Javasolt külön virtuális környezet:
 
 ```powershell
@@ -79,6 +95,10 @@ A csatolmányhozzáadás és -eltávolítás mentésig tervezet. Mégse esetén 
 fájlok változatlanok; az ügy logikai törlése sem törli a csatolmánykönyvtárat.
 A veszélyes kiterjesztések, túl nagy fájlok és útvonalból kitörő nevek elutasítottak,
 azonos fájlnév nem írhat felül másik fájlt.
+Az SQLite és a fájlrendszer nem alkot közös tranzakciót: a kezelt hibákat
+kompenzáljuk, de folyamat-/gépleállás vagy második fájlrendszerhiba után
+kézi egyeztetésre lehet szükség. Ilyenkor ne törölje a `.staging` tartalmát
+ellenőrzés nélkül; tartalmazhat helyreállítandó eredeti csatolmányt.
 
 ## Mentés, helyreállítás és telepítési határ
 
@@ -90,12 +110,44 @@ katasztrófa-helyreállítás. A teljes adatgyökérhez külön, összehangolt f
 és kipróbált helyreállítási eljárás szükséges.
 
 A visszaállítás karbantartási művelet, nem egy nyitott DB-fájl vak lecserélése.
-Minden kliensből ki kell lépni; futó kliensek mellett a művelet megtagadható.
+Az ablakból indított online visszaállítás szándékosan tiltott.
+Minden kliensből ki kell lépni; futó kliensek mellett a művelet megtagadott.
 Az üzemeltető biztosítsa, hogy régi vagy külső program sem használja az adatbázist.
 Csak ellenőrzött sémájú, integritású mentés használható, kötelező előzetes
 biztonsági másolattal. Visszaállítás után új bejelentkezés szükséges.
 Régi programverzióra visszatéréshez az eredeti offline adatgyökér-másolatot
 használja, ne a már migrált adatbázist.
+
+Az ellenőrzött offline helyreállító csak **helyi POSIX fájlrendszeren** támogatott,
+az aktuális sémaverzió mentéséből. Az üzemeltető előbb állítson le minden klienst
+és külső SQLite-eszközt, és vonja vissza más felhasználók hozzáférését az
+adatkönyvtárhoz a teljes karbantartás idejére:
+
+```bash
+python -m core.db offline-restore \
+  --database /srv/meh/db/engedelyek.db \
+  --backup /srv/meh/backup/ellenorzott.db.bak \
+  --precopy-dir /srv/meh/helyreallitas-elotti-mentes \
+  --exclusive-local
+```
+
+Az `--exclusive-local` az üzemeltető nyilatkozata, **nem automatikus bizonyíték**
+a helyi tárolóra vagy a külső kliensek hiányára. A program saját klienseit
+megosztott/kizárólagos OS-zár koordinálja; a régi vagy külső programokat ez nem
+kényszeríti együttműködésre. A művelet kötelező előmentést készít, lezárja a WAL-t,
+ellenőrzi a forrást, és csak lezárt kapcsolatok után cserél adatbázist.
+Visszavonja a mentésben tárolt munkameneteket és auditbejegyzést készít.
+Az árva hivatkozásokat a migráció megőrzi és jelzi, a visszaállító viszont
+ilyen mentést elutasít; előbb ellenőrzött adatjavítás szükséges.
+Utána állítsa vissza az ACL-eket és indítsa újra a klienseket.
+**Windows/SMB alatt ez az automatikus helyreállítás nem támogatott**; kizárólag
+üzemeltető által biztosított offline, teljes adatgyökér-helyreállítást használjon,
+vagy vigye az ellenőrzött mentést elkülönített, támogatott helyi környezetbe.
+Bizonytalan kizárólagosság esetén ne állítson vissza.
+
+A mentés és csatolmány-publikálás azonos fájlrendszeren hard link támogatást
+igényel. Ha a megosztás ezt nem biztosítja, a művelet biztonságosan hibát jelez,
+nem vált át felülíró másolásra. A migráció előtti mentés hibája megállítja az indulást.
 
 Az alapértelmezett journal `DELETE`. A `WAL` csak tudatosan konfigurált helyi
 tárolón használható; hálózati fájlrendszeren nem támogatott

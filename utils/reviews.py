@@ -52,23 +52,24 @@ def parse_date(value: Any) -> date | None:
 
 def _days(value: Any) -> int:
     if isinstance(value, bool):
-        raise ValueError("days must be a non-negative integer")
+        raise ValueError("A napok száma nemnegatív egész szám legyen.")
     if isinstance(value, int):
         result = value
     elif isinstance(value, str) and value.strip().isdigit():
         result = int(value.strip())
     else:
-        raise ValueError("days must be a non-negative integer")
+        raise ValueError("A napok száma nemnegatív egész szám legyen.")
     if not 0 <= result < date.max.toordinal():
-        raise ValueError("days must be a non-negative integer within the supported calendar")
+        raise ValueError("A napok száma kívül esik a támogatott naptári tartományon.")
     return result
 
 
 def parse_reviews(entity: Mapping[str, Any]) -> ReviewParseResult:
     """Parse typed or legacy entries, never replacing an explicit empty list.
 
-    Invalid input is reported together with its original value. Callers must
-    not serialize only ``entries`` when ``errors`` is nonempty.
+    Untyped entries with an explicit ``days`` key are relative, even when they
+    also contain a previously calculated ``date``. The original source remains
+    available as ``raw``. Invalid input must not be replaced by only ``entries``.
     """
     raw = entity.get("felulvizsgalatok")
     legacy = raw is None or raw == ""
@@ -88,32 +89,40 @@ def parse_reviews(entity: Mapping[str, Any]) -> ReviewParseResult:
             try:
                 source = json.loads(source)
             except (ValueError, TypeError):
-                return ReviewParseResult((), ("Invalid review JSON",), raw)
+                return ReviewParseResult((), ("A felülvizsgálati adatok JSON-formátuma hibás.",), raw)
         if not isinstance(source, list):
-            return ReviewParseResult((), ("Reviews must be a list",), raw)
+            return ReviewParseResult((), ("A felülvizsgálati adatoknak listát kell alkotniuk.",), raw)
     for index, item in enumerate(source):
         try:
             if not isinstance(item, dict):
-                raise ValueError("review must be an object")
+                raise ValueError("A bejegyzésnek adatobjektumnak kell lennie.")
             kind = item.get("type")
-            if kind is None and "date" in item:
-                kind = "date"
+            if kind is None:
+                if "days" in item:
+                    kind = "before_expiry"
+                elif "date" in item:
+                    kind = "date"
             note = item.get("note", "")
             if note is None:
                 note = ""
             if not isinstance(note, str):
-                raise ValueError("note must be text")
+                raise ValueError("A megjegyzés csak szöveg lehet.")
             if kind == "date":
                 actual = _date(item.get("date"))
                 if actual is None:
-                    raise ValueError("invalid review date")
+                    raise ValueError("Érvénytelen felülvizsgálati dátum.")
                 entries.append({"type": "date", "date": actual.isoformat(), "note": note})
             elif kind == "before_expiry":
-                entries.append({"type": kind, "days": _days(item.get("days")), "note": note})
+                days = _days(item.get("days"))
+                expiry = _date(entity.get("lejarat"))
+                if (expiry and entity.get("hataly_tipus") not in ("indefinite", "until_modified")
+                        and days >= expiry.toordinal()):
+                    raise ValueError("A lejárat előtti dátum kívül esik a támogatott naptári tartományon.")
+                entries.append({"type": kind, "days": days, "note": note})
             else:
-                raise ValueError("unknown review type")
+                raise ValueError("Ismeretlen felülvizsgálati típus.")
         except ValueError as exc:
-            errors.append(f"Review {index + 1}: {exc}")
+            errors.append(f"{index + 1}. felülvizsgálati bejegyzés: {exc}")
     return ReviewParseResult(tuple(entries), tuple(errors), raw, legacy)
 
 

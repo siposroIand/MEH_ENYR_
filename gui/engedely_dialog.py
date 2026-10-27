@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import mimetypes
 import subprocess
+from threading import Event, Lock
 from uuid import uuid4
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set
@@ -27,7 +28,9 @@ from PySide6.QtCore import Qt, QDate
 
 from config.app_config import get_ordered_categories
 from core.attachments import AttachmentPlan
+from core.auth import ServiceError
 from utils.reviews import parse_reviews, next_review_date, ReviewValidationError
+from gui.workers import run_task
 
 
 def qdate_to_iso(qd: QDate) -> str:
@@ -186,6 +189,8 @@ class EngedelyDialog(QDialog):
         attachments_base: Optional[str] = None,
         defaults: Optional[dict] = None,
         readonly: bool = False,
+        service=None,
+        attachment_plan=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Engedély adatlap")
@@ -194,6 +199,9 @@ class EngedelyDialog(QDialog):
 
         self.engedely = engedely or {}
         self._readonly = readonly
+        self._attachment_busy = False
+        self._attachment_close_pending = False
+        self._attachment_cancel = None
         self.temp_id = str(uuid4()) if not engedely else None
         self.attachments_base = Path(attachments_base) if attachments_base else Path.cwd() / "attachment"
 
@@ -202,7 +210,13 @@ class EngedelyDialog(QDialog):
         self.felulvizsgalatok: List[Dict[str, Any]] = [
             dict(entry) for entry in self._review_result.entries
         ]
-        self.attachment_plan = AttachmentPlan(self.attachments_base, self.engedely.get("id"))
+        if attachment_plan is not None:
+            self.attachment_plan = attachment_plan
+        elif service is not None:
+            self.attachment_plan = service.attachment_plan(
+                self.engedely.get("id"), readonly=readonly)
+        else:
+            self.attachment_plan = AttachmentPlan(self.attachments_base, self.engedely.get("id"))
 
         self._build_ui(telephelyek or [], hatosag_lista or [])
         self._populate_from_entity()
@@ -475,6 +489,7 @@ class EngedelyDialog(QDialog):
         self.save_btn = save_btn
         save_btn.setText("Mentés")
         cancel_btn = btns.button(QDialogButtonBox.Cancel)
+        self.cancel_btn = cancel_btn
         cancel_btn.setText("Mégse")
         btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
@@ -778,6 +793,10 @@ class EngedelyDialog(QDialog):
             "hataly_tipus": "fixed" if self.rb_fixed.isChecked() else "indefinite",
             "lejarat": qdate_to_iso(self.hatary_date.date()),
         }
+        parsed = parse_reviews(entity)
+        if not parsed.valid:
+            self.next_review_lbl.setText("; ".join(parsed.errors))
+            return
         nxt = next_review_date(entity)
         if nxt:
             note = next((entry.get("note") or "" for entry in self.felulvizsgalatok
@@ -795,45 +814,108 @@ class EngedelyDialog(QDialog):
 
     def load_attachments(self) -> None:
         self.attach_list.clear()
-        for fname in self.attachment_plan.list_names():
+        try:
+            names = self.attachment_plan.list_names()
+        except ServiceError as exc:
+            QMessageBox.warning(self, "Hiba", str(exc))
+            return
+        for fname in names:
             self.attach_list.addItem(fname)
 
     def cleanup_attachments(self) -> None:
         """Release staging after cancellation or the parent's service save."""
+        if self._attachment_busy:
+            self._attachment_cancel.set()
+            return
         self.attachment_plan.cleanup()
 
     def done(self, result: int) -> None:
+        if self._attachment_busy:
+            if result != QDialog.Accepted:
+                self._attachment_close_pending = True
+                self._attachment_cancel.set()
+            return
         if result != QDialog.Accepted:
             self.cleanup_attachments()
         super().done(result)
 
     def closeEvent(self, event) -> None:
+        if self._attachment_busy:
+            self._attachment_close_pending = True
+            self._attachment_cancel.set()
+            event.ignore()
+            return
         self.cleanup_attachments()
         super().closeEvent(event)
 
+    def _set_attachment_busy(self, busy: bool) -> None:
+        self._attachment_busy = busy
+        for button in (self.attach_add, self.attach_del, self.attach_view,
+                       self.save_btn, self.cancel_btn):
+            button.setEnabled(not busy and (not self._readonly or button in
+                                           (self.attach_view, self.cancel_btn)))
+
     def add_attachment(self) -> None:
-        if self._readonly:
+        if self._readonly or self._attachment_busy:
             return
         files, _ = QFileDialog.getOpenFileNames(self, "Fájl(ok) kiválasztása", str(Path.home()), "Minden fájl (*.*)")
         if not files:
             return
-        names = {name.casefold() for name in self.attachment_plan.list_names()}
-        for f in files:
-            src = Path(f)
-            name = src.name
+        plan = self.attachment_plan
+        paths = tuple(Path(filename) for filename in files)
+        cancelled, finished, lock = Event(), Event(), Lock()
+        self._attachment_cancel = cancelled
+        self._set_attachment_busy(True)
+
+        def owner_destroyed(*_):
+            with lock:
+                cancelled.set()
+                if finished.is_set():
+                    plan.cleanup()
+
+        self.destroyed.connect(owner_destroyed)
+
+        def stage_files():
+            errors = []
             try:
-                counter = 1
-                while name.casefold() in names:
-                    name = f"{src.stem}_{counter}{src.suffix}"
-                    counter += 1
-                self.attachment_plan.add(src, filename=name)
-                names.add(name.casefold())
-            except Exception as e:
-                QMessageBox.warning(self, "Hiba", f"Nem sikerült másolni: {f}\n{e}")
-        self.load_attachments()
+                names = {name.casefold() for name in plan.list_names()}
+                for src in paths:
+                    if cancelled.is_set():
+                        break
+                    name, counter = src.name, 1
+                    while name.casefold() in names:
+                        name = f"{src.stem}_{counter}{src.suffix}"
+                        counter += 1
+                    try:
+                        plan.add(src, filename=name)
+                        names.add(name.casefold())
+                    except Exception as exc:
+                        errors.append(f"{src}\n{exc}")
+                return errors
+            finally:
+                with lock:
+                    finished.set()
+                    if cancelled.is_set():
+                        plan.cleanup()
+
+        def complete(errors):
+            self.destroyed.disconnect(owner_destroyed)
+            self._set_attachment_busy(False)
+            if cancelled.is_set():
+                plan.cleanup()
+                self.reject()
+                return
+            self.load_attachments()
+            if errors:
+                QMessageBox.warning(self, "Hiba", "Nem sikerült másolni:\n" + "\n".join(errors))
+
+        def failed(exc):
+            complete([str(exc)])
+
+        run_task(self, stage_files, complete, failed)
 
     def remove_attachment(self) -> None:
-        if self._readonly:
+        if self._readonly or self._attachment_busy:
             return
         sel = self.attach_list.currentItem()
         if not sel:
@@ -853,7 +935,7 @@ class EngedelyDialog(QDialog):
             return
         try:
             fpath = self.attachment_plan.path_for(sel.text())
-        except ValueError as exc:
+        except (ValueError, ServiceError) as exc:
             QMessageBox.warning(self, "Hiba", str(exc))
             return
         if not fpath.exists():
@@ -902,14 +984,12 @@ class EngedelyDialog(QDialog):
             "kiado_hatosag": self.kiado.text().strip() or None,
             "hatarozatszam": self.hatarozatszam.text().strip(),
             "modosito_hat": None,
-            "modositok": None,
             "letrejott": qdate_to_iso(self.keltezes_date.date()) if self.keltezes_cb.isChecked() else None,
             "megjegyzes": self.megjegyzes.toPlainText().strip() or None,
         }
 
         mod_list = [self.modosito_list.item(i).text() for i in range(self.modosito_list.count())]
         if mod_list:
-            data["modositok"] = mod_list
             data["modosito_hat"] = ";".join(mod_list)
 
         if self.rb_fixed.isChecked():
@@ -961,11 +1041,12 @@ class EngedelyDialog(QDialog):
                 "hulladek_nv_gyujt": None, "hulladek_v_gyujt": None
             })
 
-        data["attachments_temp"] = None
         return data
 
     # ---------------- validation / accept ----------------
     def _on_accept(self) -> None:
+        if self._attachment_busy:
+            return
         if not self._reviews_editable():
             return
         if not self.telephely_combo.currentData():
@@ -974,7 +1055,14 @@ class EngedelyDialog(QDialog):
         if not self.hatarozatszam.text().strip():
             QMessageBox.warning(self, "Hiányzó adat", "A határozatszám megadása kötelező.")
             return
-        self._sanitize_review_entries()
+        try:
+            self._sanitize_review_entries()
+            parsed = parse_reviews(self.get_data())
+            if not parsed.valid:
+                raise ReviewValidationError("; ".join(parsed.errors))
+        except ReviewValidationError as exc:
+            QMessageBox.warning(self, "Érvénytelen felülvizsgálat", str(exc))
+            return
         self.accept()
 
     # ---------------- category/tab helper ----------------

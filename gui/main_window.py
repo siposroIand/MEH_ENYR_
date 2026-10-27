@@ -310,7 +310,11 @@ class MainWindow(QMainWindow):
         self.data = {"telephelyek": [], "engedelyek": [], "users": []}
         self._user = {}
         self._attachments_cache = {}
+        self._attachment_count_generation = 0
+        self._attachment_counts_running = False
+        self._pending_attachment_counts = None
         self._logged_out = False
+        self._closing = False
         self._backup_running = False
         self._last_export_options = {}
         initial = self.service.snapshot()  # A window must never exist without a valid session.
@@ -447,7 +451,10 @@ class MainWindow(QMainWindow):
     def open_profile(self):
         from gui.auth_dialogs import ProfileDialog
         ProfileDialog(self.auth, self).exec()
-        self.manual_refresh()
+        if self.auth.session is None:
+            self.logout()
+        else:
+            self.manual_refresh()
 
     def open_users(self):
         from gui.auth_dialogs import UsersDialog
@@ -456,6 +463,8 @@ class MainWindow(QMainWindow):
             self.manual_refresh()
 
     def _clear_session_ui(self):
+        self._attachment_count_generation += 1
+        self._pending_attachment_counts = None
         self.timer.stop()
         self._search_timer.stop()
         for dialog in self.findChildren(QDialog):
@@ -483,10 +492,11 @@ class MainWindow(QMainWindow):
             logger.exception("Session revocation failed during logout")
         finally:
             self.auth.session = None
-            self.logout_requested.emit()
             self.close()
+            self.logout_requested.emit()
 
     def closeEvent(self, event):
+        self._closing = True
         if hasattr(self, "timer"):
             self._clear_session_ui()
         if not self._logged_out:
@@ -497,9 +507,13 @@ class MainWindow(QMainWindow):
             finally:
                 self.auth.session = None
         event.accept()
+        if not self._logged_out:
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
 
     def _apply_snapshot(self, snapshot):
-        from utils.reviews import review_entries, next_review_date, compute_review_date
+        from utils.reviews import review_entries, review_occurrences, next_review_date, compute_review_date
         from utils.dates import parse_iso_date
         candidate = {key: [dict(row) for row in snapshot.get(key, [])]
                      for key in ("telephelyek", "engedelyek", "users")}
@@ -510,7 +524,16 @@ class MainWindow(QMainWindow):
             record["_lej_dt"] = parse_iso_date(record.get("lejarat"))
             record["_fv_list"] = review_entries(record)
             record["_next_fv"] = next_review_date(record) or compute_review_date(record)
+            occurrences = review_occurrences(record)
+            record["_next_fv_computed"] = any(
+                day == record["_next_fv"] and entry["type"] == "before_expiry"
+                for day, entry in occurrences)
+            record["_fv_tooltip"] = "\n".join(
+                f"{day.isoformat()}: {entry.get('note', '')}" +
+                (f" ({entry['days']} nappal a lejárat előtt, számított)" if entry["type"] == "before_expiry" else "")
+                for day, entry in occurrences)
             record["_responsible_name"] = users.get(record.get("responsible_user_id"), "Nincs felelős")
+            record["responsible_name"] = record["_responsible_name"]
             fields = [record.get(key) or "" for key in (
                 "engedely_nev", "hatarozatszam", "modosito_hat", "kiado_hatosag",
                 "megjegyzes", "kategoria", "_responsible_name")]
@@ -519,9 +542,12 @@ class MainWindow(QMainWindow):
         self.data = candidate
         self._user = user
         self._attachments_cache.clear()
+        self._attachment_count_generation += 1
         self.refresh_telephely_filter()
         self._update_profile()
         self.refresh_table()
+        self._queue_attachment_counts(
+            self._attachment_count_generation, tuple(record["id"] for record in candidate["engedelyek"]))
 
     def refresh_data(self, incremental=False):
         if self._logged_out:
@@ -577,14 +603,68 @@ class MainWindow(QMainWindow):
                 if self.table.item(index.row(), 0)]
 
     def _attachments_count(self, record):
-        identifier = record["id"]
-        if identifier not in self._attachments_cache:
-            folder = self.ATTACHMENTS_DIR / identifier
-            try:
-                self._attachments_cache[identifier] = sum(p.is_file() for p in folder.iterdir()) if folder.is_dir() else 0
-            except OSError:
-                self._attachments_cache[identifier] = 0
-        return self._attachments_cache[identifier]
+        return self._attachments_cache.get(record["id"])
+
+    def _queue_attachment_counts(self, generation, identifiers):
+        if self._closing or self._logged_out or not identifiers:
+            return
+        if self._attachment_counts_running:
+            self._pending_attachment_counts = (generation, identifiers)
+            return
+        from gui.workers import run_task
+        self._attachment_counts_running = True
+        service = self.service
+        batch_count = getattr(service, "count_attachments", None)
+
+        def count():
+            if batch_count is not None:
+                return batch_count(identifiers)
+            return {identifier: len(service.list_attachments(identifier)) for identifier in identifiers}
+
+        def done(counts):
+            self._finish_attachment_counts(generation, counts, None)
+
+        def failed(exc):
+            self._finish_attachment_counts(generation, None, exc)
+
+        run_task(self, count, done, failed)
+
+    def _finish_attachment_counts(self, generation, counts, exc):
+        self._attachment_counts_running = False
+        if self._closing or self._logged_out:
+            self._pending_attachment_counts = None
+            return
+        if generation == self._attachment_count_generation:
+            if exc is None:
+                self._attachments_cache = dict(counts)
+                self._update_attachment_cells()
+            else:
+                from core.auth import AuthenticationError
+                if isinstance(exc, AuthenticationError):
+                    self.logout()
+                    return
+                self.statusBar().showMessage(f"A csatolmányok számlálása sikertelen: {exc}")
+        pending = self._pending_attachment_counts
+        self._pending_attachment_counts = None
+        if pending is not None and pending[0] == self._attachment_count_generation:
+            self._queue_attachment_counts(*pending)
+
+    @staticmethod
+    def _attachment_text(count):
+        return "Csatolmányok…" if count is None else f"Megnyitás ({count})" if count else "Nincs csatolmány"
+
+    def _update_attachment_cells(self):
+        sorting = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+        try:
+            for row in range(self.table.rowCount()):
+                record = self.table.item(row, 0).data(Qt.UserRole)
+                item = self.table.item(row, 8)
+                text = self._attachment_text(self._attachments_count(record))
+                item.setText(text)
+                item.setToolTip(text)
+        finally:
+            self.table.setSortingEnabled(sorting)
 
     def refresh_table(self):
         if not hasattr(self, "table"):
@@ -613,9 +693,10 @@ class MainWindow(QMainWindow):
                 values = [
                     sites.get(record.get("telephely_id"), "Ismeretlen"), record.get("kategoria"),
                     record.get("engedely_nev"), record.get("hatarozatszam"), record.get("modosito_hat"),
-                    validity_text, f"{next_review.isoformat()} ({len(reviews)})" if next_review else "-",
+                    validity_text, (f"{next_review.isoformat()} ({len(reviews)})" +
+                                    (" *" if record.get("_next_fv_computed") else "")) if next_review else "-",
                     (record.get("megjegyzes") or "") + (f" [Hulladék: {waste}]" if waste else ""),
-                    f"Megnyitás ({count})" if count else "Nincs csatolmány", record.get("_responsible_name"),
+                    self._attachment_text(count), record.get("_responsible_name"),
                 ]
                 color = QColor("#ffffff")
                 deadline = record.get("_lej_dt") if validity == "fixed" else None
@@ -634,7 +715,7 @@ class MainWindow(QMainWindow):
                     item.setToolTip(str(value or ""))
                     self.table.setItem(row, column, item)
                 self.table.item(row, 0).setData(Qt.UserRole, record)
-                self.table.item(row, 6).setToolTip("\n".join(f"{day.isoformat()}: {note}" for day, note in reviews))
+                self.table.item(row, 6).setToolTip(record.get("_fv_tooltip", ""))
         finally:
             self.table.setSortingEnabled(True)
             self.table.sortItems(sort_column, sort_order)
@@ -774,7 +855,8 @@ class MainWindow(QMainWindow):
             return
         if dialog.exec() == QDialog.Accepted:
             try:
-                self._mutate(lambda: self.service.save_permit(dialog.get_data(), attachment_plan=dialog.attachment_plan))
+                self._mutate(lambda: self.service.save_permit(
+                    self._permit_values(dialog), attachment_plan=dialog.attachment_plan))
             finally:
                 dialog.cleanup_attachments()
 
@@ -785,23 +867,26 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             try:
                 self._mutate(lambda: self.service.save_permit(
-                    dict(dialog.get_data(), id=record["id"]), expected_version=record["version"],
+                    dict(self._permit_values(dialog), id=record["id"]), expected_version=record["version"],
                     attachment_plan=dialog.attachment_plan))
             finally:
                 dialog.cleanup_attachments()
 
+    @staticmethod
+    def _permit_values(dialog):
+        values = dialog.get_data()
+        values.pop("modositok", None)  # The form also supplies canonical modosito_hat.
+        values.pop("attachments_temp", None)
+        return values
+
     def _permit_dialog(self, record=None, defaults=None):
-        plan = None
         try:
             readonly = not self._can_write(record)
-            plan = self.service.attachment_plan(record["id"] if record else None, readonly=readonly)
             return EngedelyDialog(
                 self, engedely=record, telephelyek=self.data["telephelyek"],
                 hatosag_lista=self.get_hatosag_suggestions(), attachments_base=str(self.ATTACHMENTS_DIR),
-                attachment_plan=plan, readonly=readonly, defaults=defaults)
+                service=self.service, readonly=readonly, defaults=defaults)
         except Exception as exc:
-            if plan is not None:
-                plan.cleanup()
             from core.auth import AuthenticationError
             if isinstance(exc, AuthenticationError):
                 self.logout()

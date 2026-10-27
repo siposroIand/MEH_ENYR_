@@ -8,15 +8,19 @@ trusted-directory boundary.
 from __future__ import annotations
 
 import os
+import logging
 from pathlib import Path
 import shutil
 import stat
+import tempfile
 import uuid
 
-from core.auth import ValidationError
+from config.settings import MAX_ATTACHMENT_SIZE, MAX_TOTAL_ATTACHMENTS_PER_RECORD
+from core.auth import ServiceError, ValidationError
 
 
-MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+logger = logging.getLogger(__name__)
+MAX_ATTACHMENT_BYTES = MAX_ATTACHMENT_SIZE
 ALLOWED_EXTENSIONS = frozenset({
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt",
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".odt", ".ods",
@@ -55,7 +59,7 @@ def safe_attachment_path(root, permit_id, filename=None):
     root = _no_symlinks(root)
     path = root / _component(str(permit_id))
     if filename is not None:
-        path /= validate_filename(filename)
+        path /= _component(filename)
     return _no_symlinks(path)
 
 
@@ -68,14 +72,19 @@ class AttachmentPlan:
         self.root.mkdir(parents=True, exist_ok=True)
         self._staging_root = _no_symlinks(self.root / ".staging")
         self._staging_root.mkdir(exist_ok=True)
-        self._stage = self._staging_root / uuid.uuid4().hex
-        self._stage.mkdir(mode=0o700)
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="attachment-", dir=self._staging_root)
+        self._stage = Path(self._temporary_directory.name)
+        # Recovery copies must not be owned by TemporaryDirectory's finalizer.
+        self._recovery = self._staging_root / ("recovery-" + uuid.uuid4().hex)
         self._adds = {}
         self._deletes = set()
         self._published = []
         self._moved = []
         self._closed = False
         self._prepared = False
+        self._recovery_failed = False
+        self.cleanup_warnings = []
         self._read_guard = read_guard
         self._write_guard = write_guard
 
@@ -103,10 +112,21 @@ class AttachmentPlan:
                         continue
                     if path.is_file():
                         try:
-                            names.add(validate_filename(path.name))
+                            names.add(_component(path.name))
                         except ValidationError:
                             continue
         return sorted((names - self._deletes) | set(self._adds), key=str.casefold)
+
+    def _total_bytes(self, permit_id=None):
+        total = sum(_no_symlinks(path).stat().st_size for path in self._adds.values())
+        permit_id = permit_id if permit_id is not None else self.permit_id
+        if permit_id is not None:
+            directory = safe_attachment_path(self.root, permit_id)
+            if directory.exists():
+                for path in directory.iterdir():
+                    if path.name not in self._deletes and not path.is_symlink() and path.is_file():
+                        total += path.stat().st_size
+        return total
 
     def add(self, source, filename=None):
         self._open(write=True)
@@ -121,7 +141,10 @@ class AttachmentPlan:
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ATTACHMENT_BYTES:
-                raise ValidationError("Csak legfeljebb 20 MiB méretű normál fájl csatolható.")
+                raise ValidationError("Csak legfeljebb 50 MiB méretű normál fájl csatolható.")
+            base_total = self._total_bytes()
+            if base_total + info.st_size > MAX_TOTAL_ATTACHMENTS_PER_RECORD:
+                raise ValidationError("Egy engedély csatolmányainak összmérete legfeljebb 500 MiB lehet.")
             total = 0
             with os.fdopen(fd, "rb", closefd=False) as src, destination.open("xb") as dst:
                 while True:
@@ -130,7 +153,9 @@ class AttachmentPlan:
                         break
                     total += len(chunk)
                     if total > MAX_ATTACHMENT_BYTES:
-                        raise ValidationError("A csatolmány meghaladja a 20 MiB korlátot.")
+                        raise ValidationError("A csatolmány meghaladja az 50 MiB korlátot.")
+                    if base_total + total > MAX_TOTAL_ATTACHMENTS_PER_RECORD:
+                        raise ValidationError("A csatolmányok összmérete meghaladja az 500 MiB korlátot.")
                     dst.write(chunk)
         except BaseException:
             destination.unlink(missing_ok=True)
@@ -144,7 +169,7 @@ class AttachmentPlan:
 
     def delete(self, filename):
         self._open(write=True)
-        name = validate_filename(filename)
+        name = _component(filename)
         if name in self._adds:
             self._adds.pop(name).unlink()
         elif name not in self.list_names():
@@ -156,7 +181,7 @@ class AttachmentPlan:
 
     def path_for(self, filename):
         self._open()
-        name = validate_filename(filename)
+        name = _component(filename)
         if name not in self.list_names():
             raise ValidationError("A csatolmány nem található.")
         return self._adds.get(name) or safe_attachment_path(self.root, self.permit_id, name)
@@ -168,13 +193,18 @@ class AttachmentPlan:
             raise ValidationError("A csatolmányterv másik engedélyhez tartozik.")
         directory = safe_attachment_path(self.root, permit_id)
         directory.mkdir(exist_ok=True)
+        if self._adds and self._total_bytes(permit_id) > MAX_TOTAL_ATTACHMENTS_PER_RECORD:
+            raise ValidationError("A csatolmányok összmérete meghaladja az 500 MiB korlátot.")
+        if any(_no_symlinks(path).stat().st_size > MAX_ATTACHMENT_BYTES for path in self._adds.values()):
+            raise ValidationError("A csatolmány időközben meghaladta az 50 MiB korlátot.")
         self._prepared = True
         try:
             for name in sorted(self._deletes):
                 original = safe_attachment_path(self.root, permit_id, name)
                 if not original.is_file():
                     raise ValidationError("A csatolmány időközben megváltozott.")
-                saved = self._stage / uuid.uuid4().hex
+                _no_symlinks(self._recovery).mkdir(mode=0o700, exist_ok=True)
+                saved = self._recovery / name
                 original.rename(saved)
                 self._moved.append((original, saved))
             names = {p.name.casefold() for p in directory.iterdir()}
@@ -191,12 +221,33 @@ class AttachmentPlan:
             raise
 
     def rollback(self):
+        failures, remaining_published, remaining_moved = [], [], []
         for path in reversed(self._published):
-            _no_symlinks(path).unlink(missing_ok=True)
-        self._published.clear()
+            try:
+                _no_symlinks(path).unlink(missing_ok=True)
+            except (OSError, ValidationError) as exc:
+                failures.append(str(exc))
+                remaining_published.append(path)
+        self._published = remaining_published
         for original, saved in reversed(self._moved):
-            _no_symlinks(saved).rename(_no_symlinks(original))
-        self._moved.clear()
+            try:
+                _no_symlinks(saved).rename(_no_symlinks(original))
+            except (OSError, ValidationError) as exc:
+                failures.append(str(exc))
+                remaining_moved.append((original, saved))
+        self._moved = remaining_moved
+        if self._recovery.exists() and not remaining_moved:
+            try:
+                _no_symlinks(self._recovery).rmdir()
+            except (OSError, ValidationError) as exc:
+                failures.append(str(exc))
+        if failures:
+            self._recovery_failed = True
+            raise ServiceError(
+                "Az adatbázis-módosítás visszavonva, de a fájlok helyreállítása részleges. "
+                f"Az eredeti fájlok mentése: {self._recovery}; munkakönyvtár: {self._stage}. "
+                "Rendszergazdai helyreállítás szükséges. " + "; ".join(failures))
+        self._recovery_failed = False
         self._prepared = False
 
     def finalize(self):
@@ -207,12 +258,21 @@ class AttachmentPlan:
         self._moved.clear()
         try:
             _no_symlinks(self._stage)
-            shutil.rmtree(self._stage)
-        except OSError:
-            pass
+            self._temporary_directory.cleanup()
+            if self._recovery.exists():
+                _no_symlinks(self._recovery)
+                shutil.rmtree(self._recovery)
+        except (OSError, ValidationError) as exc:
+            warning = ("Az adatbázis mentése sikerült, de a csatolmányok munkakönyvtárának "
+                       f"takarítása nem sikerült: {self._stage}; helyreállítás: {self._recovery}. {exc}")
+            self.cleanup_warnings.append(warning)
+            logger.warning(warning)
 
     def cancel(self):
         if self._closed:
+            return
+        if self._recovery_failed:
+            logger.error("A helyreállítási fájlok megőrizve: %s", self._recovery)
             return
         if self._prepared:
             self.rollback()

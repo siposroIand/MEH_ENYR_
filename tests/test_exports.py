@@ -114,8 +114,38 @@ class ExportTests(unittest.TestCase):
                 excel_exporter.export_to_excel(
                     Path(directory) / "empty.xlsx", [dict(self.item, archivalt=1)], self.sites)
 
+    def test_excel_untrusted_values_remain_literal_without_formulas_or_links(self):
+        item = dict(self.item, responsible_name="=1+1", engedely_nev="=1+1",
+                    megjegyzes='=HYPERLINK("https://example.invalid","link")',
+                    kiado_hatosag="https://example.invalid")
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            for kind in ("standard", "report"):
+                with self.subTest(kind=kind):
+                    path = Path(directory) / f"{kind}.xlsx"
+                    if kind == "standard":
+                        excel_exporter.export_to_excel(path, [item], self.sites)
+                    else:
+                        report_builder_exporter.export_report_excel(
+                            str(path), [item], self.sites,
+                            ["responsible_name", "engedely_nev", "megjegyzes", "kiado_hatosag"])
+                    workbook = load_workbook(path, data_only=False)
+                    try:
+                        for sheet in workbook:
+                            headers = [cell.value for cell in sheet[1]]
+                            responsible = sheet.cell(2, headers.index("Felelős") + 1)
+                            self.assertEqual(responsible.value, "=1+1")
+                            self.assertEqual(responsible.data_type, "s")
+                            for row in sheet:
+                                for cell in row:
+                                    self.assertNotEqual(cell.data_type, "f")
+                                    self.assertIsNone(cell.hyperlink)
+                    finally:
+                        workbook.close()
+
     def test_pdf_output_and_retained_content(self):
         captured = []
+        responsible = 'Responsible <link href="https://example.invalid">name</link> & text'
+        item = dict(self.item, responsible_name=responsible)
         original_table = pdf_exporter.Table
 
         def table(data, *args, **kwargs):
@@ -127,12 +157,12 @@ class ExportTests(unittest.TestCase):
             path = Path(directory) / "permits.pdf"
             with patch.object(pdf_exporter, "Table", side_effect=table):
                 pdf_exporter.export_groups_pdf(
-                    str(path), {"Example Site": [self.item]}, {"site": "Example Site"},
+                    str(path), {"Example Site": [item]}, {"site": "Example Site"},
                     options={"include_logo": False})
             self.assertTrue(path.read_bytes().startswith(b"%PDF-"))
             self.assertGreater(path.stat().st_size, 1000)
         text = "\n".join(captured)
-        for value in ("Responsible Example", "Legacy note", "Second same-date note",
+        for value in (responsible, "Legacy note", "Second same-date note",
                       "Typed <note> & data", "Zero offset", "NV-Elő: 15"):
             self.assertIn(value, text)
         self.assertNotIn("private-", text)

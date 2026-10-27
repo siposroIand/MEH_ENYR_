@@ -1,4 +1,3 @@
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
@@ -139,7 +138,7 @@ class ProfileDialog(_AsyncDialog):
         def work():
             if new:
                 # Verify the password before changing any profile data.
-                self.auth.change_password(old, new)
+                self.auth.change_password(old, new, display_name=name)
             else:
                 self.auth.update_profile(name)
 
