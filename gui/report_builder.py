@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QSplitter, QFrame, QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit
 )
 from PySide6.QtCore import Qt
+from utils.dates import parse_iso_date as _parse_iso_date
+from utils.reviews import review_entries
 
 logger = logging.getLogger(__name__)
 
@@ -43,19 +45,6 @@ _COLUMN_KEY_NORMALIZATION = {
     "felulvizsgalat_date": "felulvizsgalat",
     "felulvizsgalat": "felulvizsgalat",
 }
-
-
-def _parse_iso_date(value) -> Optional[date]:
-    if not value:
-        return None
-    if isinstance(value, date):
-        return value
-    try:
-        if "T" in value:
-            return datetime.fromisoformat(value).date()
-        return datetime.strptime(value, "%Y-%m-%d").date()
-    except Exception:
-        return None
 
 
 def _safe_filename(s: str) -> str:
@@ -637,7 +626,7 @@ class ReportBuilderDialog(QDialog):
         items = list(self.data.get("engedelyek", []))
         filtered = []
         for e in items:
-            if not opts.get("include_archived") and e.get("archived"):
+            if not opts.get("include_archived") and e.get("archivalt"):
                 continue
             tp_ids = opts.get("telephely_ids") or []
             if tp_ids and (e.get("telephely_id") not in tp_ids):
@@ -683,19 +672,10 @@ class ReportBuilderDialog(QDialog):
                 if key == "telephely":
                     val = tp_map.get(e.get("telephely_id"), "")
                 elif key in ("lejarat", "lejarat_display"):
-                    # show full original date (YYYY.MM.DD) in preview too
-                    if val is None:
-                        val = ""
-                    else:
-                        try:
-                            if isinstance(val, date):
-                                val = val.strftime("%Y.%m.%d")
-                            elif isinstance(val, str) and "T" in val:
-                                val = datetime.fromisoformat(val).date().strftime("%Y.%m.%d")
-                            else:
-                                val = datetime.strptime(val, "%Y-%m-%d").date().strftime("%Y.%m.%d")
-                        except Exception:
-                            val = str(val) if val is not None else ""
+                    actual = _parse_iso_date(e.get("lejarat"))
+                    val = actual.strftime("%Y.%m.%d") if actual else str(val or "")
+                elif key == "felulvizsgalat":
+                    val = "\n".join(due.strftime("%Y.%m.%d") for due, _ in review_entries(e))
                 elif key == "modosito_hat" and val is not None:
                     # convert semicolons to newlines for preview
                     val = re.sub(r";\s*", "\n", (val if isinstance(val, str) else str(val)))
@@ -760,7 +740,7 @@ def run_report(
 
     # same filtering logic as before
     def _item_in_filters(e: Dict[str, Any]) -> bool:
-        if not opts.get("include_archived") and e.get("archived"):
+        if not opts.get("include_archived") and e.get("archivalt"):
             return False
         tp_ids = opts.get("telephely_ids") or []
         if tp_ids and (e.get("telephely_id") not in tp_ids):
@@ -849,54 +829,40 @@ def run_report(
     per_group = opts.get("per_group", False)
     columns = opts.get("columns") or []
 
-    # call exporter (kept simple)
-    if fmt == "PDF":
-        if per_group:
-            out_dir = QFileDialog.getExistingDirectory(parent, "Mappa kiválasztása a csoportonkénti mentéshez")
-            if not out_dir:
-                return
-            try:
-                export_fn(out_dir, groups, telephelyek, columns, fmt="PDF", title=(opts.get("title") or ""), logo_path=(opts.get("logo_path")), include_waste=True, per_group=True)
-            except Exception as exc:
-                logger.exception("Export per-group PDF error: %s", exc)
-                QMessageBox.critical(parent, "Export", f"Hiba az exportálás során: {exc}")
-                return
-            QMessageBox.information(parent, "Export", "PDF fájlok elkészültek.")
-            return
-        else:
-            path, _ = QFileDialog.getSaveFileName(parent, "PDF mentése", f"{filename_hint}.pdf", "PDF (*.pdf)")
-            if not path:
-                return
-            try:
-                export_fn(path, groups, telephelyek, columns, fmt="PDF", title=(opts.get("title") or ""), logo_path=(opts.get("logo_path")), include_waste=True, per_group=False)
-            except Exception as exc:
-                logger.exception("PDF export hiba: %s", exc)
-                QMessageBox.critical(parent, "Export", f"Hiba a PDF mentésekor: {exc}")
-                return
-            QMessageBox.information(parent, "Export", "PDF elkészült.")
-            return
+    from copy import deepcopy
+    from gui.workers import run_task
+
+    fmt = "PDF" if fmt == "PDF" else "XLSX"
+    if per_group:
+        destination = QFileDialog.getExistingDirectory(parent, "Mappa kiválasztása a csoportonkénti mentéshez")
     else:
-        if per_group:
-            out_dir = QFileDialog.getExistingDirectory(parent, "Mappa kiválasztása a csoportonkénti mentéshez")
-            if not out_dir:
-                return
-            try:
-                export_fn(out_dir, groups, telephelyek, columns, fmt="XLSX", title=(opts.get("title") or ""), include_waste=True, per_group=True)
-            except Exception as exc:
-                logger.exception("Excel per-group export hiba: %s", exc)
-                QMessageBox.critical(parent, "Export", f"Hiba az exportálás során: {exc}")
-                return
-            QMessageBox.information(parent, "Export", "Excel fájlok elkészültek.")
-            return
-        else:
-            path, _ = QFileDialog.getSaveFileName(parent, "Excel mentése", f"{filename_hint}.xlsx", "Excel (*.xlsx)")
-            if not path:
-                return
-            try:
-                export_fn(path, groups, telephelyek, columns, fmt="XLSX", title=(opts.get("title") or ""), include_waste=True, per_group=False)
-            except Exception as exc:
-                logger.exception("Excel export hiba: %s", exc)
-                QMessageBox.critical(parent, "Export", f"Hiba az Excel mentésekor: {exc}")
-                return
-            QMessageBox.information(parent, "Export", "Excel elkészült.")
-            return
+        extension = "pdf" if fmt == "PDF" else "xlsx"
+        destination, _ = QFileDialog.getSaveFileName(
+            parent, f"{fmt} mentése", f"{filename_hint}.{extension}",
+            f"{fmt} (*.{extension})",
+        )
+    if not destination:
+        return
+    snapshot_groups = deepcopy(groups)
+    snapshot_sites = deepcopy(telephelyek)
+    snapshot_columns = list(columns)
+    title = opts.get("title") or ""
+    logo = opts.get("logo_path") or logo_path
+
+    def work():
+        return export_fn(
+            destination, snapshot_groups, snapshot_sites, snapshot_columns,
+            fmt=fmt, title=title, logo_path=logo, include_waste=True, per_group=per_group,
+        )
+
+    def success(_):
+        QMessageBox.information(parent, "Export", "A kimutatás elkészült.")
+
+    def failure(exc):
+        QMessageBox.critical(
+            parent, "Export",
+            f"Hiba az exportálás során: {exc}\n"
+            "Csoportonkénti exportnál az előzőleg elkészült fájlok megmaradhattak.",
+        )
+
+    return run_task(parent, work, success, failure)

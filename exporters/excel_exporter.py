@@ -14,16 +14,16 @@ Advanced Excel exporter for MEH Engedelynyilvantarto.
 """
 import re
 import pandas as pd
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.cell.rich_text import CellRichText, Text
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
-import json
 
 from config.app_config import get_ordered_categories
-from utils.dates import compute_review_date
+from utils.reviews import review_entries as _extract_review_entries
 
 # Full column set: mapping keys used internally -> (header text, row_key)
 ALL_COLUMNS: List[Tuple[str, str]] = [
@@ -36,6 +36,7 @@ ALL_COLUMNS: List[Tuple[str, str]] = [
     ("letrejott", "Létrejött"),
     ("lejarat_display", "Hatálya"),
     ("felulvizsgalat", "Felülvizsgálat"),
+    ("responsible_name", "Felelős"),
     ("megjegyzes", "Megjegyzés"),
     ("hulladek_nv_elokez", "NV-Előkezelés"),
     ("hulladek_v_elokez", "V-Előkezelés"),
@@ -75,86 +76,6 @@ def _format_hatya(e: dict, out_date_format: str = "%Y.%m.%d") -> str:
     if ht == "indefinite" or (not ht and e.get("hatarozatlan")):
         return "Határozatlan"
     return "Változtatásig"
-
-
-def _extract_review_entries(e: dict) -> List[tuple]:
-    """
-    Return list of tuples (date_obj, note_str). date_obj is a datetime.date.
-    Fallback order:
-     - explicit felulvizsgalatok (JSON or python list)
-     - explicit felulvizsgalat_date single
-     - computed from felulvizsgalat_nap + lejarat
-     - compute_review_date(e) single fallback
-    """
-    entries: List[tuple] = []
-    raw = e.get("felulvizsgalatok")
-    if raw:
-        try:
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(parsed, list):
-                for it in parsed:
-                    if isinstance(it, dict):
-                        d = it.get("date")
-                        note = (it.get("note") or "").strip()
-                        if d:
-                            try:
-                                dd = datetime.fromisoformat(d).date()
-                                entries.append((dd, note))
-                            except Exception:
-                                try:
-                                    dd = datetime.strptime(str(d), "%Y.%m.%d").date()
-                                    entries.append((dd, note))
-                                except Exception:
-                                    continue
-        except Exception:
-            entries = []
-
-    if not entries:
-        fv_single = e.get("felulvizsgalat_date")
-        if fv_single:
-            try:
-                dd = datetime.fromisoformat(fv_single).date()
-                entries.append((dd, ""))
-            except Exception:
-                try:
-                    dd = datetime.strptime(str(fv_single), "%Y.%m.%d").date()
-                    entries.append((dd, ""))
-                except Exception:
-                    pass
-
-    if not entries:
-        try:
-            fv_nap = int(e.get("felulvizsgalat_nap") or 0)
-        except Exception:
-            fv_nap = 0
-        lej = e.get("lejarat")
-        if fv_nap > 0 and lej:
-            try:
-                ld = datetime.fromisoformat(lej).date()
-            except Exception:
-                try:
-                    ld = datetime.strptime(str(lej), "%Y.%m.%d").date()
-                except Exception:
-                    ld = None
-            if ld:
-                comp = ld - timedelta(days=fv_nap)
-                entries.append((comp, f"{fv_nap} nappal a lejárat előtt (számított)"))
-
-    if not entries:
-        try:
-            fv = compute_review_date(e)
-            if fv:
-                entries.append((fv, ""))
-        except Exception:
-            pass
-
-    # sort and unique by date
-    unique = {}
-    for dt, note in entries:
-        key = dt.isoformat()
-        if key not in unique:
-            unique[key] = (dt, note or "")
-    return [unique[k] for k in sorted(unique.keys())]
 
 
 def _format_review_dates_only(e: dict, date_format: str = "%Y.%m.%d") -> str:
@@ -242,6 +163,7 @@ def _prepare_row(e: dict, tp_map: dict, date_format: str, include_waste: bool) -
     row["lejarat_display"] = _format_hatya(e, out_date_format="%Y.%m.%d")
     # Felülvizsgálat: csak a dátumok egymás alatt, külön oszlopban (most note-okkal kiegészítve)
     row["felulvizsgalat"] = _format_review_dates_only(e, date_format) or ""
+    row["responsible_name"] = e.get("responsible_name") or ""
     # Megjegyzés: csak az eredeti megjegyzés (nem fűzünk ide felülvizsgálati blokkot)
     row["megjegyzes"] = e.get("megjegyzes") or ""
     if include_waste:
@@ -304,6 +226,8 @@ def export_to_excel(path: str, items: List[dict], telephelyek: List[dict], optio
         return out
 
     items = _apply_prefilters(items)
+    if not items:
+        raise ValueError("No items to export")
 
     # prepare rows
     prepared = [_prepare_row(e, tp_map, date_format, include_waste) for e in items]
@@ -386,6 +310,10 @@ def export_to_excel(path: str, items: List[dict], telephelyek: List[dict], optio
                 # Data cells: enable wrap_text and top alignment to preserve DB line breaks
                 for row_idx, c in enumerate(col, start=1):
                     try:
+                        if isinstance(c.value, str):
+                            # Permit/profile text must never become an Excel formula.
+                            c.data_type = "s"
+                            c.hyperlink = None
                         v = str(c.value) if c.value is not None else ""
                         if len(v) > max_len:
                             max_len = len(v)
@@ -430,14 +358,14 @@ def export_to_excel(path: str, items: List[dict], telephelyek: List[dict], optio
                             m = line_re.match(line)
                             if m:
                                 datepart, sep, rest = m.group(1), m.group(2) or "", m.group(3) or ""
-                                rt.append(Text(datepart, font=Font(bold=True)))
+                                rt.append(TextBlock(InlineFont(b=True), datepart))
                                 if sep or rest:
-                                    rt.append(Text(sep + rest, font=Font(bold=False)))
+                                    rt.append(sep + rest)
                             else:
                                 # fallback: no date recognized, keep as normal text
-                                rt.append(Text(line, font=Font(bold=False)))
+                                rt.append(line)
                             if i != len(lines) - 1:
-                                rt.append(Text("\n", font=Font(bold=False)))
+                                rt.append("\n")
                         # assign rich text object back to cell
                         cell.value = rt
                         cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)

@@ -10,12 +10,10 @@ Felülvizsgálat: egyszerűsítve — csak FIX dátum vagy "n nappal a lejárat 
 """
 from __future__ import annotations
 
-import shutil
 import mimetypes
 import subprocess
-import json
+from threading import Event, Lock
 from uuid import uuid4
-from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set
 
@@ -29,6 +27,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QDate
 
 from config.app_config import get_ordered_categories
+from core.attachments import ALLOWED_EXTENSIONS, AttachmentPlan
+from core.auth import ServiceError
+from utils.reviews import parse_reviews, next_review_date, ReviewValidationError
+from gui.workers import run_task
 
 
 def qdate_to_iso(qd: QDate) -> str:
@@ -36,7 +38,7 @@ def qdate_to_iso(qd: QDate) -> str:
 
 
 def iso_to_qdate(s: Optional[str]) -> Optional[QDate]:
-    if not s:
+    if not isinstance(s, str) or not s:
         return None
     d = QDate.fromString(s, "yyyy-MM-dd")
     return d if d.isValid() else None
@@ -123,7 +125,9 @@ class ReviewEntryDialog(QDialog):
                     self.date_edit.setDate(d)
                 self.rb_date.setChecked(True)
             elif t == "before_expiry":
-                self.before_spin.setValue(int(entry.get("days") or 0))
+                days = int(entry.get("days") or 0)
+                self.before_spin.setMaximum(max(self.before_spin.maximum(), days))
+                self.before_spin.setValue(days)
                 self.rb_before.setChecked(True)
             self.note_edit.setPlainText(entry.get("note") or "")
         else:
@@ -142,6 +146,7 @@ class ReviewEntryDialog(QDialog):
     def _update_enabled(self) -> None:
         self.date_edit.setEnabled(self.rb_date.isChecked())
         self.before_spin.setEnabled(self.rb_before.isChecked() and self.rb_before.isEnabled())
+        self._validate()
 
     def _serialize_current(self) -> str:
         if self.rb_date.isChecked():
@@ -182,6 +187,10 @@ class EngedelyDialog(QDialog):
         telephelyek: Optional[List[dict]] = None,
         hatosag_lista: Optional[List[str]] = None,
         attachments_base: Optional[str] = None,
+        defaults: Optional[dict] = None,
+        readonly: bool = False,
+        service=None,
+        attachment_plan=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Engedély adatlap")
@@ -189,17 +198,50 @@ class EngedelyDialog(QDialog):
         self.resize(1100, 720)
 
         self.engedely = engedely or {}
+        self._readonly = readonly
+        self._attachment_busy = False
+        self._attachment_close_pending = False
+        self._attachment_cancel = None
         self.temp_id = str(uuid4()) if not engedely else None
         self.attachments_base = Path(attachments_base) if attachments_base else Path.cwd() / "attachment"
 
         # internal list of felulvizsgalat entries: list of typed dicts
-        self.felulvizsgalatok: List[Dict[str, Any]] = []
+        self._review_result = parse_reviews(self.engedely)
+        self.felulvizsgalatok: List[Dict[str, Any]] = [
+            dict(entry) for entry in self._review_result.entries
+        ]
+        if attachment_plan is not None:
+            self.attachment_plan = attachment_plan
+        elif service is not None:
+            self.attachment_plan = service.attachment_plan(
+                self.engedely.get("id"), readonly=readonly)
+        else:
+            self.attachment_plan = AttachmentPlan(self.attachments_base, self.engedely.get("id"))
 
         self._build_ui(telephelyek or [], hatosag_lista or [])
         self._populate_from_entity()
+        if not self.engedely and defaults:
+            site = defaults.get("telephely_id", defaults.get("site"))
+            idx = self.telephely_combo.findData(site)
+            if idx >= 0:
+                self.telephely_combo.setCurrentIndex(idx)
+            category = defaults.get("kategoria", defaults.get("category"))
+            if category:
+                self.kategoria.setCurrentText(category)
         self.load_attachments()
         # enable waste tab initially depending on category
         self.on_category_changed(self.kategoria.currentText())
+        if self._readonly:
+            for kind in (QLineEdit, QTextEdit, QComboBox, QCheckBox, QDateEdit,
+                         QRadioButton, QSpinBox):
+                for widget in self.findChildren(kind):
+                    widget.setEnabled(False)
+            for button in (self.modosito_add_btn, self.modosito_edit_btn,
+                           self.modosito_up_btn, self.modosito_down_btn,
+                           self.modosito_del_btn, self.btn_fv_add, self.btn_fv_edit,
+                           self.btn_fv_del, self.attach_add, self.attach_del, self.save_btn):
+                button.setEnabled(False)
+            self.modosito_list.itemDoubleClicked.disconnect(self._on_modosito_edit)
 
     def _build_ui(self, telephelyek: List[dict], hatosag_lista: List[str]) -> None:
         main_v = QVBoxLayout(self)
@@ -331,6 +373,7 @@ class EngedelyDialog(QDialog):
         self.hatary_date = QDateEdit(QDate.currentDate().addYears(5))
         self.hatary_date.setCalendarPopup(True)
         self.hatary_date.setEnabled(True)
+        self.hatary_date.dateChanged.connect(self._on_hataly_changed)
         self.rb_fixed.toggled.connect(self._on_hataly_changed)
         self.rb_indef.toggled.connect(self._on_hataly_changed)
         self.rb_until_mod.toggled.connect(self._on_hataly_changed)
@@ -368,13 +411,8 @@ class EngedelyDialog(QDialog):
         fv_entries_row.addLayout(fv_buttons_v)
         fv_v.addLayout(fv_entries_row)
 
-    # --- környező rész a fájlból ---
         self.next_review_lbl = QLabel("")
-        # korábban: self.next_review_lbl.setStyleSheet("font-weight: bold;")
-        # új: legyen vastag és piros a figyelem felkeltéséhez
         self.next_review_lbl.setStyleSheet("font-weight: bold; color: red;")
-        fv_v.addWidget(self.next_review_lbl)
-        # --- vége ---
         fv_v.addWidget(self.next_review_lbl)
 
         form_right.addRow(fv_box)
@@ -448,8 +486,10 @@ class EngedelyDialog(QDialog):
         # buttons (Save/Cancel)
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         save_btn = btns.button(QDialogButtonBox.Save)
+        self.save_btn = save_btn
         save_btn.setText("Mentés")
         cancel_btn = btns.button(QDialogButtonBox.Cancel)
+        self.cancel_btn = cancel_btn
         cancel_btn.setText("Mégse")
         btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
@@ -536,8 +576,7 @@ class EngedelyDialog(QDialog):
 
     # ---------------- hataly / fv logic ----------------
     def _on_hataly_changed(self, _=None) -> None:
-        # hatály/változás állapot változásakor frissítjük a felülvizsgálati megjelenítést
-        # (a részletes felülvizsgálati módválasztás a Hozzáadás párbeszédben történik)
+        self.hatary_date.setEnabled(self.rb_fixed.isChecked())
         self._update_fv_entries_list()
 
     # ---------------- populate ----------------
@@ -584,30 +623,7 @@ class EngedelyDialog(QDialog):
             else:
                 self.rb_until_mod.setChecked(True)
 
-            # load typed felulvizsgalatok (support only 'date' and 'before_expiry' shapes)
-            self.felulvizsgalatok = []
-            fv_list_raw = e.get("felulvizsgalatok")
-            if fv_list_raw:
-                try:
-                    if isinstance(fv_list_raw, str):
-                        parsed = json.loads(fv_list_raw)
-                    else:
-                        parsed = fv_list_raw
-                    if isinstance(parsed, list):
-                        for it in parsed:
-                            if isinstance(it, dict) and it.get("type") in ("date", "before_expiry"):
-                                self.felulvizsgalatok.append(it)
-                except Exception:
-                    self.felulvizsgalatok = []
-
-            # backwards: synthesize from old fields if necessary
-            if not self.felulvizsgalatok:
-                fv_date = iso_to_qdate(e.get("felulvizsgalat_date"))
-                fv_nap = int(e.get("felulvizsgalat_nap") or 0)
-                if fv_date:
-                    self.felulvizsgalatok.append({"type": "date", "date": qdate_to_iso(fv_date), "note": ""})
-                elif fv_nap > 0:
-                    self.felulvizsgalatok.append({"type": "before_expiry", "days": fv_nap, "note": ""})
+            self.felulvizsgalatok = [dict(entry) for entry in self._review_result.entries]
 
             self.megjegyzes.setPlainText(e.get("megjegyzes") or "")
 
@@ -646,6 +662,9 @@ class EngedelyDialog(QDialog):
 
     def _sanitize_review_entries(self) -> None:
         """Sort and dedupe review entries by serialized form (date before before_expiry)."""
+        parsed = parse_reviews({"felulvizsgalatok": self.felulvizsgalatok})
+        if not parsed.valid:
+            raise ReviewValidationError("; ".join(parsed.errors))
         cleaned: List[Dict[str, Any]] = []
         seen: Set[str] = set()
         for it in self.felulvizsgalatok:
@@ -687,7 +706,22 @@ class EngedelyDialog(QDialog):
             self.fv_entries_list.addItem(item)
         self._update_next_review_label()
 
+    def _reviews_editable(self) -> bool:
+        if self._readonly:
+            QMessageBox.warning(self, "Csak olvasható", "Ez az engedély csak megtekinthető.")
+            return False
+        if not self._review_result.valid:
+            QMessageBox.warning(
+                self, "Érvénytelen felülvizsgálat",
+                "A tárolt felülvizsgálati adatok hibásak. Mentés vagy szerkesztés előtt "
+                "javítani kell az eredeti adatokat.\n" + "; ".join(self._review_result.errors),
+            )
+            return False
+        return True
+
     def add_review_entry(self) -> None:
+        if not self._reviews_editable():
+            return
         expiry_iso = None
         if self.rb_fixed.isChecked():
             expiry_iso = qdate_to_iso(self.hatary_date.date()) if self.hatary_date else None
@@ -702,6 +736,8 @@ class EngedelyDialog(QDialog):
             self._update_fv_entries_list()
 
     def edit_review_entry(self) -> None:
+        if not self._reviews_editable():
+            return
         sel = self.fv_entries_list.currentItem()
         if not sel:
             return
@@ -731,6 +767,8 @@ class EngedelyDialog(QDialog):
             self._update_fv_entries_list()
 
     def remove_review_entry(self) -> None:
+        if not self._reviews_editable():
+            return
         sel = self.fv_entries_list.currentItem()
         if not sel:
             return
@@ -744,90 +782,149 @@ class EngedelyDialog(QDialog):
         self._update_fv_entries_list()
 
     def _update_next_review_label(self) -> None:
+        if not self._review_result.valid:
+            self.next_review_lbl.setText("Hibás felülvizsgálati adatok — javítás szükséges")
+            return
         if not self.felulvizsgalatok:
             self.next_review_lbl.setText("Következő felülvizsgálat: nincs bejegyzés")
             return
-        today = date.today()
-        today_iso = today.isoformat()
-        candidates: List[tuple] = []
-        for it in self.felulvizsgalatok:
-            if it.get("type") == "date":
-                d = it.get("date")
-                if d and d >= today_iso:
-                    candidates.append((d, it))
-            elif it.get("type") == "before_expiry":
-                # need expiry to compute actual date
-                if not self.rb_fixed.isChecked():
-                    continue
-                try:
-                    expiry = iso_to_qdate(qdate_to_iso(self.hatary_date.date()))
-                    if not expiry:
-                        continue
-                    expiry_dt = date(expiry.year(), expiry.month(), expiry.day())
-                    days = int(it.get("days") or 0)
-                    cand_dt = expiry_dt - timedelta(days=days)
-                    cand_iso = cand_dt.isoformat()
-                    if cand_iso >= today_iso:
-                        candidates.append((cand_iso, it))
-                except Exception:
-                    continue
-        if candidates:
-            nxt = min(candidates, key=lambda x: x[0])
-            it = nxt[1]
-            label = it.get("note") or ""
-            self.next_review_lbl.setText(f"Következő felülvizsgálat: {nxt[0]} — {label}")
+        entity = {
+            "felulvizsgalatok": self.felulvizsgalatok,
+            "hataly_tipus": "fixed" if self.rb_fixed.isChecked() else "indefinite",
+            "lejarat": qdate_to_iso(self.hatary_date.date()),
+        }
+        parsed = parse_reviews(entity)
+        if not parsed.valid:
+            self.next_review_lbl.setText("; ".join(parsed.errors))
+            return
+        nxt = next_review_date(entity)
+        if nxt:
+            note = next((entry.get("note") or "" for entry in self.felulvizsgalatok
+                         if next_review_date(dict(entity, felulvizsgalatok=[entry])) == nxt), "")
+            self.next_review_lbl.setText(f"Következő felülvizsgálat: {nxt.isoformat()} — {note}")
         else:
             self.next_review_lbl.setText("Következő felülvizsgálat: nincs jövőbeli bejegyzés (csak fix dátumok számíthatók)")
 
-    # ---------------- attachments (unchanged) ----------------
+    # ---------------- staged attachments ----------------
     def get_attach_dir(self) -> Path:
         if self.engedely and self.engedely.get("id"):
-            return self.attachments_base / self.engedely["id"]
+            return self.attachments_base / str(self.engedely["id"])
         else:
             return self.attachments_base / f"temp_{self.temp_id}"
 
     def load_attachments(self) -> None:
         self.attach_list.clear()
-        adir = self.get_attach_dir()
-        if adir.exists() and adir.is_dir():
-            for fname in sorted([p.name for p in adir.iterdir() if p.is_file()]):
-                self.attach_list.addItem(fname)
+        try:
+            names = self.attachment_plan.list_names()
+        except ServiceError as exc:
+            QMessageBox.warning(self, "Hiba", str(exc))
+            return
+        for fname in names:
+            self.attach_list.addItem(fname)
+
+    def cleanup_attachments(self) -> None:
+        """Release staging after cancellation or the parent's service save."""
+        if self._attachment_busy:
+            self._attachment_cancel.set()
+            return
+        self.attachment_plan.cleanup()
+
+    def done(self, result: int) -> None:
+        if self._attachment_busy:
+            if result != QDialog.Accepted:
+                self._attachment_close_pending = True
+                self._attachment_cancel.set()
+            return
+        if result != QDialog.Accepted:
+            self.cleanup_attachments()
+        super().done(result)
+
+    def closeEvent(self, event) -> None:
+        if self._attachment_busy:
+            self._attachment_close_pending = True
+            self._attachment_cancel.set()
+            event.ignore()
+            return
+        self.cleanup_attachments()
+        super().closeEvent(event)
+
+    def _set_attachment_busy(self, busy: bool) -> None:
+        self._attachment_busy = busy
+        for button in (self.attach_add, self.attach_del, self.attach_view,
+                       self.save_btn, self.cancel_btn):
+            button.setEnabled(not busy and (not self._readonly or button in
+                                           (self.attach_view, self.cancel_btn)))
 
     def add_attachment(self) -> None:
+        if self._readonly or self._attachment_busy:
+            return
         files, _ = QFileDialog.getOpenFileNames(self, "Fájl(ok) kiválasztása", str(Path.home()), "Minden fájl (*.*)")
         if not files:
             return
-        adir = self.get_attach_dir()
-        adir.mkdir(parents=True, exist_ok=True)
-        for f in files:
-            src = Path(f)
-            dest = adir / src.name
+        plan = self.attachment_plan
+        paths = tuple(Path(filename) for filename in files)
+        cancelled, finished, lock = Event(), Event(), Lock()
+        self._attachment_cancel = cancelled
+        self._set_attachment_busy(True)
+
+        def owner_destroyed(*_):
+            with lock:
+                cancelled.set()
+                if finished.is_set():
+                    plan.cleanup()
+
+        self.destroyed.connect(owner_destroyed)
+
+        def stage_files():
+            errors = []
             try:
-                if dest.exists():
-                    stem, ext = dest.stem, dest.suffix
-                    dest = adir / f"{stem}_{int(datetime.now().timestamp())}{ext}"
-                shutil.copy2(str(src), str(dest))
-            except Exception as e:
-                QMessageBox.warning(self, "Hiba", f"Nem sikerült másolni: {f}\n{e}")
-        self.load_attachments()
+                names = {name.casefold() for name in plan.list_names()}
+                for src in paths:
+                    if cancelled.is_set():
+                        break
+                    name, counter = src.name, 1
+                    while name.casefold() in names:
+                        name = f"{src.stem}_{counter}{src.suffix}"
+                        counter += 1
+                    try:
+                        plan.add(src, filename=name)
+                        names.add(name.casefold())
+                    except Exception as exc:
+                        errors.append(f"{src}\n{exc}")
+                return errors
+            finally:
+                with lock:
+                    finished.set()
+                    if cancelled.is_set():
+                        plan.cleanup()
+
+        def complete(errors):
+            self.destroyed.disconnect(owner_destroyed)
+            self._set_attachment_busy(False)
+            if cancelled.is_set():
+                plan.cleanup()
+                self.reject()
+                return
+            self.load_attachments()
+            if errors:
+                QMessageBox.warning(self, "Hiba", "Nem sikerült másolni:\n" + "\n".join(errors))
+
+        def failed(exc):
+            complete([str(exc)])
+
+        run_task(self, stage_files, complete, failed)
 
     def remove_attachment(self) -> None:
+        if self._readonly or self._attachment_busy:
+            return
         sel = self.attach_list.currentItem()
         if not sel:
             return
         fname = sel.text()
         if QMessageBox.question(self, "Törlés", f"Tényleg törli a kiválasztott fájlt?\n{fname}") != QMessageBox.Yes:
             return
-        fpath = self.get_attach_dir() / fname
         try:
-            if fpath.exists():
-                fpath.unlink()
-            adir = self.get_attach_dir()
-            if adir.exists() and not any(adir.iterdir()):
-                try:
-                    adir.rmdir()
-                except Exception:
-                    pass
+            self.attachment_plan.delete(fname)
             self.load_attachments()
         except Exception as e:
             QMessageBox.warning(self, "Hiba", f"Nem sikerült törölni: {e}")
@@ -836,11 +933,25 @@ class EngedelyDialog(QDialog):
         sel = self.attach_list.currentItem()
         if not sel:
             return
-        fpath = self.get_attach_dir() / sel.text()
+        try:
+            fpath = self.attachment_plan.path_for(sel.text())
+        except (ValueError, ServiceError) as exc:
+            QMessageBox.warning(self, "Hiba", str(exc))
+            return
         if not fpath.exists():
             QMessageBox.warning(self, "Hiba", "Fájl nem található.")
             self.load_attachments()
             return
+        if fpath.suffix.lower() not in ALLOWED_EXTENSIONS:
+            answer = QMessageBox.question(
+                self, "Biztonsági figyelmeztetés",
+                "Ez egy régi, nem támogatott típusú csatolmány, amely programot is "
+                "futtathat. Csak megbízható forrásból származó fájlt nyisson meg.\n"
+                f"Biztosan megnyitja?\n{sel.text()}",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
         mime, _ = mimetypes.guess_type(str(fpath))
         if mime and mime.startswith("image"):
             try:
@@ -883,14 +994,12 @@ class EngedelyDialog(QDialog):
             "kiado_hatosag": self.kiado.text().strip() or None,
             "hatarozatszam": self.hatarozatszam.text().strip(),
             "modosito_hat": None,
-            "modositok": None,
             "letrejott": qdate_to_iso(self.keltezes_date.date()) if self.keltezes_cb.isChecked() else None,
             "megjegyzes": self.megjegyzes.toPlainText().strip() or None,
         }
 
         mod_list = [self.modosito_list.item(i).text() for i in range(self.modosito_list.count())]
         if mod_list:
-            data["modositok"] = mod_list
             data["modosito_hat"] = ";".join(mod_list)
 
         if self.rb_fixed.isChecked():
@@ -911,8 +1020,12 @@ class EngedelyDialog(QDialog):
         data["felulvizsgalat_date"] = None
 
         # typed felulvizsgalatok
-        self._sanitize_review_entries()
-        if self.felulvizsgalatok:
+        if not self._review_result.valid:
+            data["felulvizsgalatok"] = self._review_result.raw
+            data["felulvizsgalat_nap"] = self.engedely.get("felulvizsgalat_nap")
+            data["felulvizsgalat_date"] = self.engedely.get("felulvizsgalat_date")
+        else:
+            self._sanitize_review_entries()
             data["felulvizsgalatok"] = self.felulvizsgalatok.copy()
             date_entries = [it for it in self.felulvizsgalatok if it.get("type") == "date"]
             before_entries = [it for it in self.felulvizsgalatok if it.get("type") == "before_expiry"]
@@ -938,22 +1051,28 @@ class EngedelyDialog(QDialog):
                 "hulladek_nv_gyujt": None, "hulladek_v_gyujt": None
             })
 
-        data["attachments_temp"] = None
-        if not self.engedely:
-            tmp = self.get_attach_dir()
-            if tmp.exists() and any(tmp.iterdir()):
-                data["attachments_temp"] = str(tmp)
         return data
 
     # ---------------- validation / accept ----------------
     def _on_accept(self) -> None:
+        if self._attachment_busy:
+            return
+        if not self._reviews_editable():
+            return
         if not self.telephely_combo.currentData():
             QMessageBox.warning(self, "Hiányzó adat", "Válasszon telephelyet a legördülőből.")
             return
         if not self.hatarozatszam.text().strip():
             QMessageBox.warning(self, "Hiányzó adat", "A határozatszám megadása kötelező.")
             return
-        self._sanitize_review_entries()
+        try:
+            self._sanitize_review_entries()
+            parsed = parse_reviews(self.get_data())
+            if not parsed.valid:
+                raise ReviewValidationError("; ".join(parsed.errors))
+        except ReviewValidationError as exc:
+            QMessageBox.warning(self, "Érvénytelen felülvizsgálat", str(exc))
+            return
         self.accept()
 
     # ---------------- category/tab helper ----------------

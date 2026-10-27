@@ -3,8 +3,6 @@
 """
 TelephelyDialog - telephely hozzáadás / szerkesztés dialógus
 """
-import logging
-from uuid import uuid4
 from typing import Optional
 
 from PySide6.QtWidgets import (
@@ -12,9 +10,6 @@ from PySide6.QtWidgets import (
     QMessageBox
 )
 from PySide6.QtCore import Qt
-
-logger = logging.getLogger("engedely_nyilvantarto")
-
 
 class TelephelyDialog(QDialog):
     """
@@ -36,14 +31,14 @@ class TelephelyDialog(QDialog):
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignRight)
 
-        self.name_inp = QLineEdit(self.telephely.get("nev", ""))
+        self.name_inp = QLineEdit(self.telephely.get("nev") or "")
         self.name_inp.setPlaceholderText("Telephely megnevezése (kötelező)")
         self.name_inp.setMinimumWidth(300)
 
-        self.ktj_inp = QLineEdit(self.telephely.get("ktj", ""))
+        self.ktj_inp = QLineEdit(self.telephely.get("ktj") or "")
         self.ktj_inp.setPlaceholderText("KTJ szám (opcionális)")
 
-        self.cim_inp = QLineEdit(self.telephely.get("cim", ""))
+        self.cim_inp = QLineEdit(self.telephely.get("cim") or "")
         self.cim_inp.setPlaceholderText("Cím (opcionális)")
 
         form.addRow("Telephely neve*", self.name_inp)

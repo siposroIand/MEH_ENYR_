@@ -1,8 +1,12 @@
 from pathlib import Path
 from typing import Dict, List
+import os
 
 # hálózati gyökér (szerkeszthető) 
-NETWORK_ROOT = Path(r"M:\home\IT apps\MEH_Programok\MEH_Engedelynyilvantarto\#adatbazis")
+NETWORK_ROOT = Path(os.environ.get(
+    "MEH_DATA_ROOT",
+    r"M:\home\IT apps\MEH_Programok\MEH_Engedelynyilvantarto\#adatbazis",
+))
 
 APP_NAME = "MEH - Engedely Nyilvantarto Rendszer"
 DB_FILENAME = "engedelyek.db"
