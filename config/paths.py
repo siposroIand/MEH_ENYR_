@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-import time
+import tempfile
 from pathlib import Path
 from typing import Dict
 
@@ -40,18 +40,21 @@ def get_resource_path(relative_path: str) -> Path:
     return candidates[0]
 
 
-def get_app_root(network_root: Path | None = None, raise_on_fail: bool = False) -> Path:
+def get_app_root(network_root: Path | None = None) -> Path:
     if network_root:
         try:
             candidate = Path(network_root).expanduser().resolve()
             candidate.mkdir(parents=True, exist_ok=True)
-            test_file = candidate / f".writetest_{int(time.time())}"
-            test_file.write_text("ok", encoding="utf-8")
-            test_file.unlink(missing_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix=".writetest_", dir=candidate
+            ) as test_file:
+                test_file.write("ok")
             return candidate
-        except Exception:
-            if raise_on_fail:
-                raise RuntimeError(f"Hálózati gyökér nem elérhető/írható: {network_root}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Hálózati gyökér nem hozható létre vagy nem írható: {network_root}. "
+                f"Részlet: {e}"
+            ) from e
 
     if getattr(sys, "frozen", False):
         root = Path(sys.executable).resolve().parent
@@ -69,12 +72,14 @@ def ensure_dirs(dirs: Dict[str, Path]) -> None:
     for p in dirs.values():
         try:
             Path(p).mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        except OSError as e:
+            raise RuntimeError(
+                f"Könyvtár nem hozható létre: {p}. Részlet: {e}"
+            ) from e
 
 
 def build_app_dirs(network_root: Path | None) -> Dict[str, Path]:
-    root = get_app_root(network_root, raise_on_fail=True)
+    root = get_app_root(network_root)
     dirs = default_dirs(root)
     ensure_dirs(dirs)
     return dirs
