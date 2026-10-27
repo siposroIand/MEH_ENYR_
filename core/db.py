@@ -15,6 +15,7 @@ from random import uniform
 import json
 
 from utils.fs_utils import create_lockfile, release_lockfile, atomic_replace
+from config.paths import ensure_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +51,7 @@ class Database:
     def __init__(self, db_path: Path, backup_dir: Optional[Path] = None):
         self.db_path = Path(db_path)
         self.backup_dir = Path(backup_dir) if backup_dir else self.db_path.parent
-        self.backup_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_dirs({"backup": self.backup_dir, "db": self.db_path.parent})
 
         # startup backup (nem kritikus)
         try:
