@@ -351,6 +351,20 @@ class DialogTests(unittest.TestCase):
         self.assertIn("1. felülvizsgálati bejegyzés", warning.call_args.args[2])
         self.assertNotEqual(dialog.result(), QDialog.Accepted)
 
+    def test_legacy_executable_preview_requires_explicit_confirmation(self):
+        original = self.original()
+        (original / "legacy.exe").write_text("legacy attachment")
+        dialog = self.dialog({"id": "permit"})
+        for index in range(dialog.attach_list.count()):
+            if dialog.attach_list.item(index).text() == "legacy.exe":
+                dialog.attach_list.setCurrentRow(index)
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.No) as question, \
+                patch("gui.engedely_dialog.subprocess.Popen") as launch:
+            dialog.view_attachment()
+        question.assert_called_once()
+        launch.assert_not_called()
+        self.assertEqual(question.call_args.args[-1], QMessageBox.No)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,16 @@ def validate_filename(name):
     return name
 
 
+def _existing_filename(name):
+    if (not isinstance(name, str) or not name or name in {".", ".."}
+            or any(c in name for c in "/\\:") or any(ord(c) < 32 for c in name)):
+        raise ValidationError("Érvénytelen fájlnév.")
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"{p}{i}" for p in ("COM", "LPT") for i in range(1, 10)}
+    if name.split(".")[0].strip().upper() in reserved:
+        raise ValidationError("Fenntartott fájlnév.")
+    return name
+
+
 def _no_symlinks(path):
     path = Path(path).absolute()
     for candidate in (*reversed(path.parents), path):
@@ -59,8 +69,23 @@ def safe_attachment_path(root, permit_id, filename=None):
     root = _no_symlinks(root)
     path = root / _component(str(permit_id))
     if filename is not None:
-        path /= _component(filename)
+        path /= _existing_filename(filename)
     return _no_symlinks(path)
+
+
+def attachment_names(root, permit_id):
+    directory = safe_attachment_path(root, permit_id)
+    if not directory.exists():
+        return []
+    names = []
+    for path in directory.iterdir():
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            names.append(_existing_filename(path.name))
+        except ValidationError:
+            continue
+    return sorted(names, key=str.casefold)
 
 
 class AttachmentPlan:
@@ -103,18 +128,7 @@ class AttachmentPlan:
 
     def list_names(self):
         self._open()
-        names = set()
-        if self.permit_id:
-            directory = safe_attachment_path(self.root, self.permit_id)
-            if directory.exists():
-                for path in directory.iterdir():
-                    if path.is_symlink():
-                        continue
-                    if path.is_file():
-                        try:
-                            names.add(_component(path.name))
-                        except ValidationError:
-                            continue
+        names = set(attachment_names(self.root, self.permit_id)) if self.permit_id else set()
         return sorted((names - self._deletes) | set(self._adds), key=str.casefold)
 
     def _total_bytes(self, permit_id=None):
@@ -169,7 +183,7 @@ class AttachmentPlan:
 
     def delete(self, filename):
         self._open(write=True)
-        name = _component(filename)
+        name = _existing_filename(filename)
         if name in self._adds:
             self._adds.pop(name).unlink()
         elif name not in self.list_names():
@@ -181,7 +195,7 @@ class AttachmentPlan:
 
     def path_for(self, filename):
         self._open()
-        name = _component(filename)
+        name = _existing_filename(filename)
         if name not in self.list_names():
             raise ValidationError("A csatolmány nem található.")
         return self._adds.get(name) or safe_attachment_path(self.root, self.permit_id, name)
@@ -250,7 +264,7 @@ class AttachmentPlan:
         self._recovery_failed = False
         self._prepared = False
 
-    def finalize(self):
+    def finalize(self, *, committed=False):
         # Called only after DB commit. Failure to clean staging must not turn a
         # successful database write into an apparent failure.
         self._closed = True
@@ -263,7 +277,8 @@ class AttachmentPlan:
                 _no_symlinks(self._recovery)
                 shutil.rmtree(self._recovery)
         except (OSError, ValidationError) as exc:
-            warning = ("Az adatbázis mentése sikerült, de a csatolmányok munkakönyvtárának "
+            outcome = "Az adatbázis mentése sikerült, de " if committed else ""
+            warning = (outcome + "a csatolmányok munkakönyvtárának "
                        f"takarítása nem sikerült: {self._stage}; helyreállítás: {self._recovery}. {exc}")
             self.cleanup_warnings.append(warning)
             logger.warning(warning)

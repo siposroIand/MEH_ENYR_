@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from core.auth import (
     AuthenticationError, ConflictError, LoginThrottled, PermissionDenied,
-    Session, ValidationError, hash_password, verify_password,
+    ServiceError, Session, ValidationError, hash_password, transaction, verify_password,
 )
 from core.attachments import (
     AttachmentPlan, MAX_ATTACHMENT_BYTES, safe_attachment_path, validate_filename,
@@ -20,6 +20,35 @@ from core.services import PermitService
 
 
 PASSWORD = "correct horse battery staple"
+
+
+class TransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(__file__).parent / (".transaction-test-" + uuid4().hex)
+        self.directory.mkdir()
+        self.addCleanup(shutil.rmtree, self.directory)
+        self.db = Database(self.directory / "database.db", self.directory / "backups")
+        self.addCleanup(self.db.close)
+
+    def test_busy_errors_translate_only_after_rollback(self):
+        with self.assertRaisesRegex(ServiceError, "adatbázis jelenleg foglalt"):
+            with transaction(self.db) as conn:
+                conn.execute("INSERT INTO telephelyek(id,nev) VALUES('rolled-back','Test')")
+                raise sqlite3.OperationalError("database is locked")
+        self.assertEqual(self.db.get_telephelyek(), [])
+
+    def test_real_busy_begin_is_translated_without_retry(self):
+        with self.db.get_connection(immediate=True):
+            with self.assertRaisesRegex(ServiceError, "frissítse az adatokat"):
+                with transaction(self.db):
+                    self.fail("A busy transaction must not execute its body")
+
+    def test_nontransient_sql_errors_are_preserved_and_rolled_back(self):
+        with self.assertRaisesRegex(sqlite3.OperationalError, "no such column"):
+            with transaction(self.db) as conn:
+                conn.execute("INSERT INTO telephelyek(id,nev) VALUES('rolled-back','Test')")
+                conn.execute("SELECT absent_column FROM telephelyek")
+        self.assertEqual(self.db.get_telephelyek(), [])
 
 
 class PasswordTests(unittest.TestCase):
@@ -88,6 +117,7 @@ class ServiceTests(unittest.TestCase):
         values = {
             "telephely_id": self.site["id"], "engedely_nev": "Próba",
             "kategoria": "Levegőtisztaság-védelem",
+            "hatarozatszam": "TEST/2030/1",
             "hataly_tipus": "fixed", "lejarat": "2030-12-31",
             "felulvizsgalatok": [{"type": "before_expiry", "days": 0, "note": "Határnap"}],
         }
@@ -318,7 +348,7 @@ class ServiceTests(unittest.TestCase):
             {"kategoria": ""}, {"telephely_id": "missing"},
             {"lejarat": "2030-02-31"}, {"felulvizsgalatok": "invalid"},
             {"felulvizsgalatok": [{"type": "before_expiry", "days": -1}]},
-            {"hataly_tipus": "indefinite"},
+            {"hataly_tipus": "not-a-kind"},
             {"felulvizsgalatok": [{"type": "date", "date": "invalid"}]},
             {"arbitrary_column = 1": "injection"},
         ):
@@ -331,6 +361,77 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(json.loads(record["felulvizsgalatok"])[0]["type"], "before_expiry")
         changed = self.admin.save_permit({"id": record["id"], "felulvizsgalatok": []}, record["version"])
         self.assertEqual(json.loads(changed["felulvizsgalatok"]), [])
+
+    def test_nonfixed_permits_retain_dormant_relative_review_rules(self):
+        from datetime import date
+        from utils.reviews import review_dates
+        record = self.permit(felulvizsgalatok=[
+            {"type": "date", "date": "2030-01-01"},
+            {"type": "before_expiry", "days": 0},
+            {"type": "before_expiry", "days": 30},
+        ])
+        rules = json.loads(record["felulvizsgalatok"])
+        for kind in ("indefinite", "until_modified"):
+            record = self.admin.save_permit({"id": record["id"], "hataly_tipus": kind}, record["version"])
+            self.assertEqual(json.loads(record["felulvizsgalatok"]), rules)
+            self.assertEqual(review_dates(record), [date(2030, 1, 1)])
+        record = self.admin.save_permit({"id": record["id"], "hataly_tipus": "fixed",
+                                        "lejarat": "2030-12-31"}, record["version"])
+        self.assertEqual(json.loads(record["felulvizsgalatok"]), rules)
+        self.assertEqual(review_dates(record), [date(2030, 1, 1), date(2030, 12, 1), date(2030, 12, 31)])
+
+    def test_optional_subject_and_untouched_malformed_reviews(self):
+        record = self.permit(engedely_nev="")
+        self.assertEqual(record["engedely_nev"], "")
+        malformed = '[{"type":"date","date":"broken"}'
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE engedelyek SET felulvizsgalatok=? WHERE id=?", (malformed, record["id"]))
+        record = self.admin.snapshot()["permits"][0]
+        archived = self.admin.bulk_update([record["id"]], {"archivalt": 1},
+                                          {record["id"]: record["version"]})[0]
+        self.assertEqual(archived["felulvizsgalatok"], malformed)
+        assigned = self.admin.assign([record["id"]], self.clerk_user["id"],
+                                     {record["id"]: archived["version"]})[0]
+        self.assertEqual(assigned["felulvizsgalatok"], malformed)
+        with self.assertRaises(ValidationError):
+            self.clerk.save_permit({"id": record["id"], "felulvizsgalatok": "new malformed"},
+                                   assigned["version"])
+        corrected = self.clerk.save_permit({"id": record["id"], "felulvizsgalatok": []},
+                                           assigned["version"])
+        self.assertEqual(json.loads(corrected["felulvizsgalatok"]), [])
+
+    def test_decision_number_required_for_create_and_explicit_changes(self):
+        record = self.permit(engedely_nev="")
+        before = self.audit_count()
+        with self.assertRaisesRegex(ValidationError, "határozatszám"):
+            self.admin.save_permit({"telephely_id": self.site["id"], "kategoria": "Próba"})
+        for value in (None, "", "   ", 7):
+            with self.assertRaises(ValidationError):
+                self.permit(hatarozatszam=value)
+            with self.assertRaises(ValidationError):
+                self.admin.save_permit({"id": record["id"], "hatarozatszam": value}, record["version"])
+        self.assertEqual(self.audit_count(), before)
+        snapshot = self.admin.snapshot()["permits"]
+        self.assertEqual(len(snapshot), 1)
+        self.assertEqual(snapshot[0]["version"], record["version"])
+        self.assertEqual(snapshot[0]["hatarozatszam"], "TEST/2030/1")
+
+    def test_legacy_missing_decision_number_allows_unrelated_mutations(self):
+        record = self.permit()
+        with self.db.get_connection() as conn:
+            conn.execute("UPDATE engedelyek SET hatarozatszam=NULL WHERE id=?", (record["id"],))
+        record = self.admin.snapshot()["permits"][0]
+        record = self.admin.bulk_update([record["id"]], {"archivalt": 1},
+                                        {record["id"]: record["version"]})[0]
+        self.assertIsNone(record["hatarozatszam"])
+        record = self.admin.assign([record["id"]], self.clerk_user["id"],
+                                   {record["id"]: record["version"]})[0]
+        self.assertIsNone(record["hatarozatszam"])
+        record = self.clerk.save_permit({"id": record["id"], "megjegyzes": "Legacy retained"},
+                                       record["version"])
+        self.assertIsNone(record["hatarozatszam"])
+        with self.assertRaises(ValidationError):
+            self.clerk.save_permit({"id": record["id"], "hatarozatszam": ""}, record["version"])
 
     def test_audit_failure_rolls_back_mutation(self):
         before = self.audit_count()
@@ -354,6 +455,21 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         with self.assertRaises(ValidationError):
             self.admin.restore_backup(backup)
+
+    def test_backup_does_not_hold_writer_lock_during_slow_copy(self):
+        make_backup = self.db.make_backup
+        refreshes = []
+
+        def copy_without_application_lock(*args, **kwargs):
+            refreshes.append(self.viewer.snapshot())
+            with self.db.get_connection(immediate=True) as conn:
+                conn.execute("SELECT COUNT(*) FROM users").fetchone()
+            return make_backup(*args, **kwargs)
+
+        with patch.object(self.db, "make_backup", side_effect=copy_without_application_lock):
+            backup = self.admin.create_backup()
+        self.assertTrue(backup.is_file())
+        self.assertEqual(len(refreshes), 1)
 
     def test_gui_convenience_aliases_preserve_versions_and_permissions(self):
         record = self.permit(self.clerk)
@@ -405,6 +521,7 @@ class ServiceTests(unittest.TestCase):
         record = self.clerk.save_permit({
             "telephely_id": self.site["id"], "engedely_nev": "With attachment",
             "kategoria": "Levegőtisztaság-védelem",
+            "hatarozatszam": "ATTACH/2030/1",
         }, attachment_plan=plan)
         destination = self.clerk.attachment_path(record["id"], "document.pdf")
         self.assertEqual(destination.read_bytes(), source.read_bytes())
@@ -529,6 +646,107 @@ class ServiceTests(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 self.admin.save_attachments(record["id"], plan, record["version"])
         self.assertEqual(self.admin.list_attachments(record["id"]), [])
+
+    def test_legacy_attachment_extensions_remain_visible_and_accessible(self):
+        record = self.permit()
+        directory = self.root / record["id"]
+        directory.mkdir(parents=True)
+        legacy = directory / "legacy.exe"
+        legacy.write_bytes(b"retained")
+        hidden = directory / ".old-data"
+        hidden.write_bytes(b"also retained")
+        self.assertEqual(self.viewer.list_attachments(record["id"]), [".old-data", "legacy.exe"])
+        self.assertEqual(self.viewer.attachment_path(record["id"], legacy.name), legacy.absolute())
+        with self.admin.attachment_plan(record["id"]) as plan:
+            self.assertEqual(plan.path_for(legacy.name).read_bytes(), b"retained")
+            plan.delete(legacy.name)
+            self.assertTrue(legacy.exists())
+            self.admin.save_attachments(record["id"], plan, record["version"])
+        self.assertFalse(legacy.exists())
+
+    def test_attachment_counts_authorize_once_and_scan_outside_database_lock(self):
+        first, second = self.permit(), self.permit()
+        self.admin.add_attachments(first["id"], [self.source()], first["version"])
+        self.assertEqual(self.viewer.count_attachments([first["id"], second["id"]]),
+                         {first["id"]: 1, second["id"]: 0})
+        from core.attachments import attachment_names
+        scans = []
+
+        def unlocked_scan(root, permit_id):
+            self.viewer.snapshot()
+            with self.db.get_connection(immediate=True) as conn:
+                conn.execute("SELECT COUNT(*) FROM users").fetchone()
+            scans.append(permit_id)
+            return attachment_names(root, permit_id)
+
+        with patch("core.services.attachment_names", side_effect=unlocked_scan):
+            self.assertEqual(self.viewer.count_attachments([first["id"]]), {first["id"]: 1})
+            self.assertEqual(self.viewer.list_attachments(first["id"]), ["document.pdf"])
+        self.assertEqual(scans, [first["id"], first["id"]])
+        self.assertEqual(self.viewer.count_attachments([]), {})
+        with self.assertRaises(ConflictError):
+            self.viewer.count_attachments(["missing"])
+        self.viewer.logout()
+        with self.assertRaises(AuthenticationError):
+            self.viewer.count_attachments([first["id"]])
+
+    def test_attachment_total_limit_uses_existing_and_staged_files(self):
+        record = self.permit()
+        source = self.source(content=b"123456")
+        record = self.admin.add_attachments(record["id"], [source], record["version"])
+        with self.admin.attachment_plan(record["id"]) as plan:
+            with patch("core.attachments.MAX_TOTAL_ATTACHMENTS_PER_RECORD", 10):
+                with self.assertRaises(ValidationError):
+                    plan.add(self.source("second.txt", b"12345"))
+                plan.delete("document.pdf")
+                plan.add(self.directory / "second.txt")
+                record = self.admin.save_attachments(record["id"], plan, record["version"])
+        self.assertEqual(self.admin.list_attachments(record["id"]), ["second.txt"])
+
+    def test_attachment_cleanup_failure_warns_but_committed_save_succeeds(self):
+        record = self.permit()
+        plan = self.admin.attachment_plan(record["id"])
+        stage = plan._stage
+        plan.add(self.source())
+        with patch.object(plan._temporary_directory, "cleanup", side_effect=OSError("cleanup denied")):
+            with self.assertLogs("core.attachments", level="WARNING"):
+                saved = self.admin.save_attachments(record["id"], plan, record["version"])
+        self.assertEqual(saved["version"], record["version"] + 1)
+        warnings = self.admin.take_warnings()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("mentése sikerült", warnings[0])
+        self.assertIn(str(stage), warnings[0])
+        self.assertEqual(self.admin.take_warnings(), [])
+        plan._temporary_directory.cleanup()
+
+    def test_attachment_compensation_failure_preserves_recovery_and_explains_partial_state(self):
+        record = self.permit()
+        record = self.admin.add_attachments(record["id"], [self.source()], record["version"])
+        plan = self.admin.attachment_plan(record["id"])
+        plan.delete("document.pdf")
+        original_rename = Path.rename
+
+        def prevent_restore(path, target):
+            if path.parent == plan._recovery:
+                raise OSError("restore denied")
+            return original_rename(path, target)
+
+        from core.services import audit
+
+        def fail_attachment_audit(conn, actor_id, action, *args, **kwargs):
+            if action == "attachments_changed":
+                raise sqlite3.OperationalError("abort after files")
+            return audit(conn, actor_id, action, *args, **kwargs)
+
+        with patch("core.services.audit", side_effect=fail_attachment_audit), patch.object(Path, "rename", prevent_restore):
+            with self.assertRaisesRegex(ServiceError, "helyreállítása részleges"):
+                self.admin.save_attachments(record["id"], plan, record["version"])
+        self.assertEqual((plan._recovery / "document.pdf").read_bytes(), b"original content")
+        with self.assertLogs("core.attachments", level="ERROR"):
+            plan.cancel()
+        self.assertTrue((plan._recovery / "document.pdf").exists())
+        plan.rollback()
+        plan.cancel()
 
 
 if __name__ == "__main__":

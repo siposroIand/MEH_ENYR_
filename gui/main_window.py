@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import logging
 import os
 import shlex
@@ -16,13 +17,14 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog,
-    QDialogButtonBox, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog,
+    QDialogButtonBox, QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QTabWidget,
     QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from config.app_config import get_ordered_categories
+from core.attachments import ALLOWED_EXTENSIONS
 from exporters.excel_exporter import export_to_excel as export_excel_fn
 from exporters.pdf_exporter import export_groups_pdf
 from gui.engedely_dialog import EngedelyDialog
@@ -284,16 +286,26 @@ class ReviewDialog(QDialog):
         try:
             if Path(path).suffix.lower() == ".csv":
                 with open(path, "w", encoding="utf-8-sig", newline="") as stream:
-                    csv.writer(stream, delimiter=";").writerows(rows)
+                    csv.writer(stream, delimiter=";").writerows(
+                        [self._csv_text(value) for value in row] for row in rows)
             else:
                 from openpyxl import Workbook
                 workbook = Workbook()
+                worksheet = workbook.active
                 for row in rows:
-                    workbook.active.append(row)
+                    worksheet.append(row)
+                    for cell in worksheet[worksheet.max_row]:
+                        if isinstance(cell.value, str):
+                            cell.data_type = "s"
                 workbook.save(str(Path(path).with_suffix(".xlsx")))
             info(self, "Export", "Sikeres exportálás.")
         except Exception as exc:
             error(self, "Export", str(exc))
+
+    @staticmethod
+    def _csv_text(value):
+        text = str(value)
+        return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) else text
 
 
 class MainWindow(QMainWindow):
@@ -313,13 +325,17 @@ class MainWindow(QMainWindow):
         self._attachment_count_generation = 0
         self._attachment_counts_running = False
         self._pending_attachment_counts = None
+        self._snapshot_generation = 0
+        self._snapshot_refresh_running = False
+        self._pending_snapshot_refresh = None
         self._logged_out = False
         self._closing = False
         self._backup_running = False
+        self._export_running = False
         self._last_export_options = {}
         initial = self.service.snapshot()  # A window must never exist without a valid session.
         self.setWindowTitle(APP_TITLE)
-        self.resize(1500, 800)
+        self.resize(1400, 760)
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
@@ -374,47 +390,63 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSortingEnabled(True)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
-        self.table.setColumnWidth(2, 260)
-        self.table.setColumnWidth(6, 150)
-        self.table.setColumnWidth(8, 145)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        self.table.setColumnWidth(2, 320)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
+        self.table.setColumnWidth(5, 78)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        self.table.setColumnWidth(6, 97)
+        header.setSectionResizeMode(7, QHeaderView.Stretch)
+        header.setSectionResizeMode(8, QHeaderView.Fixed)
+        self.table.setColumnWidth(8, 105)
+        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)
         self.table.cellDoubleClicked.connect(self._on_table_double_click)
         self.table.filesDropped.connect(self._on_files_dropped)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
         layout.addWidget(self.table)
 
-        actions = QHBoxLayout()
-        definitions = [
-            ("btn_tel", "Telephelyek", self.open_telephely_manager),
-            ("btn_eng", "Engedély rögzítés", self.add_engedely),
-            ("btn_assign", "Felelős kijelölése", self.assign_selected),
-            ("btn_show_expiring", "Lejáró engedélyek", self.show_expiring_dialog),
-            ("btn_reviews", "Felülvizsgálatok", self.show_reviews_dialog),
-            ("btn_refresh", "Frissítés", self.manual_refresh),
-        ]
-        for name, title, slot in definitions:
-            button = QPushButton(title)
-            setattr(self, name, button)
-            button.clicked.connect(slot)
-            actions.addWidget(button)
-        layout.addLayout(actions)
-        tools = QHBoxLayout()
-        definitions = [
-            ("btn_quick_tp", "Telephelyenkénti export", lambda: self.batch_export("telephely")),
-            ("btn_quick_kat", "Engedély szerinti export", lambda: self.batch_export("kategoria")),
-            ("btn_excel", "Excel Export", self.export_to_excel),
-            ("btn_view_export", "Kimutatáskészítő", self.open_report_builder),
-            ("btn_backup_now", "Mentés készítése", self.create_backup_now),
-            ("btn_backup_list", "Mentések", self.open_backup_dialog),
-        ]
-        for name, title, slot in definitions:
-            button = QPushButton(title)
-            setattr(self, name, button)
-            button.clicked.connect(slot)
-            tools.addWidget(button)
-        layout.addLayout(tools)
+        controls = QHBoxLayout()
+        groups = (
+            ("Adminisztráció", (
+                ("btn_tel", "Telephelyek", self.open_telephely_manager),
+                ("btn_eng", "Engedély rögzítés", self.add_engedely),
+                ("btn_assign", "Felelős kijelölése", self.assign_selected),
+                ("btn_show_expiring", "⚠️ Lejáró engedélyek", self.show_expiring_dialog),
+                ("btn_reviews", "📝 Felülvizsgálatok", self.show_reviews_dialog),
+            )),
+            ("Exportálás", (
+                ("btn_quick_tp", "🏭 Telephelyenkénti export", lambda: self.batch_export("telephely")),
+                ("btn_quick_kat", "📄 Engedély szerinti export", lambda: self.batch_export("kategoria")),
+                ("btn_excel", "📊 Excel Export", self.export_to_excel),
+                ("btn_view_export", "📊 Kimutatáskészítő", self.open_report_builder),
+            )),
+            ("Rendszer / Mentések", (
+                ("btn_refresh", "🔄 Frissítés", self.manual_refresh),
+                ("btn_backup_now", "⤓ Mentés készítése", self.create_backup_now),
+                ("btn_backup_list", "🔒 Mentések", self.open_backup_dialog),
+            )),
+        )
+        for title, definitions in groups:
+            group = QGroupBox(title)
+            row = QHBoxLayout(group)
+            row.setContentsMargins(8, 6, 8, 6)
+            for name, text, slot in definitions:
+                button = QPushButton(text)
+                setattr(self, name, button)
+                button.clicked.connect(slot)
+                row.addWidget(button)
+            controls.addWidget(group)
+            if title != "Rendszer / Mentések":
+                controls.addSpacing(10)
+            if title == "Exportálás":
+                controls.addStretch()
+        layout.addLayout(controls)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.silent_refresh)
         self.timer.start(300000)
@@ -449,8 +481,16 @@ class MainWindow(QMainWindow):
         self.btn_eng.setEnabled(user.get("role") in ("admin", "clerk"))
 
     def open_profile(self):
+        from core.auth import AuthenticationError
         from gui.auth_dialogs import ProfileDialog
-        ProfileDialog(self.auth, self).exec()
+        try:
+            ProfileDialog(self.auth, self).exec()
+        except AuthenticationError:
+            self.logout()
+            return
+        except Exception as exc:
+            error(self, "Profil", str(exc))
+            return
         if self.auth.session is None:
             self.logout()
         else:
@@ -463,6 +503,8 @@ class MainWindow(QMainWindow):
             self.manual_refresh()
 
     def _clear_session_ui(self):
+        self._snapshot_generation += 1
+        self._pending_snapshot_refresh = None
         self._attachment_count_generation += 1
         self._pending_attachment_counts = None
         self.timer.stop()
@@ -470,6 +512,7 @@ class MainWindow(QMainWindow):
         for dialog in self.findChildren(QDialog):
             dialog.reject()
             dialog.close()
+            dialog.hide()  # Busy dialogs may defer closing until their worker cleans staging.
         self._attachments_cache.clear()
         self.data = {"telephelyek": [], "engedelyek": [], "users": []}
         self.table.setRowCount(0)
@@ -477,6 +520,9 @@ class MainWindow(QMainWindow):
         self.global_search.clear()
         self.telephely_filter.set_items([])
         self.kategoria_filter.set_checked_by_data([])
+        self.responsibility_filter.blockSignals(True)
+        self.responsibility_filter.clear()
+        self.responsibility_filter.blockSignals(False)
         self._last_export_options = {}
         self._user = {}
         self._search_timer.stop()
@@ -532,7 +578,9 @@ class MainWindow(QMainWindow):
                 f"{day.isoformat()}: {entry.get('note', '')}" +
                 (f" ({entry['days']} nappal a lejárat előtt, számított)" if entry["type"] == "before_expiry" else "")
                 for day, entry in occurrences)
-            record["_responsible_name"] = users.get(record.get("responsible_user_id"), "Nincs felelős")
+            assignee = record.get("responsible_user_id")
+            record["_responsible_name"] = users.get(
+                assignee, "Ismeretlen felelős" if assignee else "Nincs felelős")
             record["responsible_name"] = record["_responsible_name"]
             fields = [record.get(key) or "" for key in (
                 "engedely_nev", "hatarozatszam", "modosito_hat", "kiado_hatosag",
@@ -544,40 +592,112 @@ class MainWindow(QMainWindow):
         self._attachments_cache.clear()
         self._attachment_count_generation += 1
         self.refresh_telephely_filter()
+        self.refresh_responsibility_filter()
         self._update_profile()
         self.refresh_table()
         self._queue_attachment_counts(
             self._attachment_count_generation, tuple(record["id"] for record in candidate["engedelyek"]))
 
     def refresh_data(self, incremental=False):
-        if self._logged_out:
+        """Synchronous compatibility API; user/timer refreshes use the worker."""
+        if self._logged_out or self._closing:
             return False
+        self._snapshot_generation += 1
         try:
             snapshot = self.service.snapshot()
             self._apply_snapshot(snapshot)
             self.statusBar().clearMessage()
             return True
         except Exception as exc:
-            from core.auth import AuthenticationError
-            if isinstance(exc, AuthenticationError):
-                self.logout()
-                return False
-            logger.exception("Snapshot refresh failed")
-            self.statusBar().showMessage(f"Frissítés sikertelen, az utolsó sikeres nézet látható: {exc}")
+            self._snapshot_failed(exc)
             return False
 
     def manual_refresh(self):
-        self.refresh_data()
+        if self._logged_out or self._closing:
+            return
+        self._snapshot_generation += 1
+        generation = self._snapshot_generation
+        if self._snapshot_refresh_running:
+            self._pending_snapshot_refresh = generation
+            return
+        self._start_snapshot_refresh(generation)
+
+    def _start_snapshot_refresh(self, generation):
+        from gui.workers import run_task
+        self._snapshot_refresh_running = True
+        self.statusBar().showMessage("Frissítés folyamatban…")
+        service = self.service
+
+        def done(snapshot):
+            self._finish_snapshot_refresh(generation, snapshot, None)
+
+        def failed(exc):
+            self._finish_snapshot_refresh(generation, None, exc)
+
+        run_task(self, service.snapshot, done, failed)
+
+    def _finish_snapshot_refresh(self, generation, snapshot, exc):
+        self._snapshot_refresh_running = False
+        if self._logged_out or self._closing:
+            self._pending_snapshot_refresh = None
+            return
+        if generation == self._snapshot_generation:
+            if exc is not None:
+                self._snapshot_failed(exc)
+            else:
+                try:
+                    self._apply_snapshot(snapshot)
+                    self.statusBar().clearMessage()
+                except Exception as failure:
+                    self._snapshot_failed(failure)
+        if self._logged_out or self._closing:
+            return
+        pending = self._pending_snapshot_refresh
+        self._pending_snapshot_refresh = None
+        if pending is not None and pending == self._snapshot_generation:
+            self._start_snapshot_refresh(pending)
+
+    def _snapshot_failed(self, exc):
+        from core.auth import AuthenticationError
+        if isinstance(exc, AuthenticationError):
+            self.logout()
+            return
+        logger.error("Snapshot refresh failed: %s", exc)
+        self.statusBar().showMessage(f"Frissítés sikertelen, az utolsó sikeres nézet látható: {exc}")
 
     def silent_refresh(self):
         if not self.global_search.hasFocus():
-            self.refresh_data()
+            self.manual_refresh()
 
     def refresh_telephely_filter(self):
         selected = self.telephely_filter.checked_data()
         self.telephely_filter.set_items([
             (site.get("nev", "Ismeretlen"), site["id"], site["id"] in selected)
             for site in self.data["telephelyek"]])
+
+    def refresh_responsibility_filter(self):
+        selected = self.responsibility_filter.currentData()
+        selected_text = self.responsibility_filter.currentText()
+        self.responsibility_filter.blockSignals(True)
+        try:
+            self.responsibility_filter.clear()
+            for label, value in (("Összes felelős", "all"), ("Saját engedélyeim", "own"),
+                                 ("Nincs felelős", "unassigned")):
+                self.responsibility_filter.addItem(label, value)
+            users = sorted(self.data["users"],
+                           key=lambda user: (user.get("display_name") or user.get("username") or "").casefold())
+            for user in users:
+                name = user.get("display_name") or user.get("username") or "Ismeretlen felhasználó"
+                if not user.get("active", 1):
+                    name += " (inaktív)"
+                self.responsibility_filter.addItem(f"Személy: {name}", f"person:{user['id']}")
+            index = self.responsibility_filter.findData(selected)
+            if index < 0 and isinstance(selected, str) and selected.startswith("person:"):
+                self.responsibility_filter.addItem(selected_text, selected)
+                index = self.responsibility_filter.count() - 1
+            self.responsibility_filter.setCurrentIndex(max(index, 0))
+        finally:
+            self.responsibility_filter.blockSignals(False)
 
     def _get_filtered_items(self):
         items = [e for e in self.data["engedelyek"] if not e.get("deleted")]
@@ -589,13 +709,16 @@ class MainWindow(QMainWindow):
         categories = self.kategoria_filter.checked_data()
         sites = self.telephely_filter.checked_data()
         responsibility = self.responsibility_filter.currentData()
+        person_id = responsibility.removeprefix("person:") if (
+            isinstance(responsibility, str) and responsibility.startswith("person:")) else None
         return [record for record in items
                 if (not categories or record.get("kategoria") in categories)
                 and (not sites or record.get("telephely_id") in sites)
                 and (self.show_archived.isChecked() or not record.get("archivalt"))
                 and all(token.casefold() in record.get("_search_index", "") for token in tokens)
                 and (responsibility != "own" or record.get("responsible_user_id") == self._current_user().get("id"))
-                and (responsibility != "unassigned" or not record.get("responsible_user_id"))]
+                and (responsibility != "unassigned" or not record.get("responsible_user_id"))
+                and (person_id is None or record.get("responsible_user_id") == person_id)]
 
     def _get_selected_entities(self):
         return [self.table.item(index.row(), 0).data(Qt.UserRole)
@@ -619,7 +742,14 @@ class MainWindow(QMainWindow):
         def count():
             if batch_count is not None:
                 return batch_count(identifiers)
-            return {identifier: len(service.list_attachments(identifier)) for identifier in identifiers}
+            counts = {}
+            for identifier in identifiers:
+                plan = service.attachment_plan(identifier, readonly=True)
+                try:
+                    counts[identifier] = len(plan.list_names())
+                finally:
+                    plan.cleanup()
+            return counts
 
         def done(counts):
             self._finish_attachment_counts(generation, counts, None)
@@ -739,7 +869,22 @@ class MainWindow(QMainWindow):
                 return False
             error(self, "Művelet sikertelen", str(exc))
             return False
+        messages = []
+        try:
+            take_warnings = getattr(self.service, "take_warnings", None)
+            if callable(take_warnings):
+                messages = list(take_warnings() or [])
+        except Exception as exc:
+            from core.auth import AuthenticationError
+            if isinstance(exc, AuthenticationError):
+                self.logout()
+                return True
+            messages = [
+                f"A művelet mentése sikerült, de a figyelmeztetések lekérése nem sikerült: {exc}"
+            ]
         self.refresh_data()
+        if messages and not self._logged_out and not self._closing:
+            warning(self, "Művelet végrehajtva – figyelmeztetés", "\n".join(map(str, messages)))
         return True
 
     @staticmethod
@@ -901,9 +1046,22 @@ class MainWindow(QMainWindow):
                 info(self, "Fájlok", INFO_NO_ATTACHMENTS)
             else:
                 path = self.service.attachment_path(record["id"], names[0])
+                if len(names) == 1 and path.suffix.lower() not in ALLOWED_EXTENSIONS:
+                    if not confirm(
+                        self, "Biztonsági figyelmeztetés",
+                        "Ez egy régi, nem támogatott típusú csatolmány, amely programot is "
+                        "futtathat. Csak megbízható forrásból származó fájlt nyisson meg.\n"
+                        f"Biztosan megnyitja?\n{path.name}",
+                    ):
+                        return
+                    path = self.service.attachment_path(record["id"], names[0])
                 _open_path(path if len(names) == 1 else path.parent)
         except Exception as exc:
-            error(self, "Fájlok", str(exc))
+            from core.auth import AuthenticationError
+            if isinstance(exc, AuthenticationError):
+                self.logout()
+            else:
+                error(self, "Fájlok", str(exc))
 
     def open_backup_dialog(self):
         if self._is_admin():
@@ -931,6 +1089,8 @@ class MainWindow(QMainWindow):
         run_task(self, self.service.create_backup, done, failed)
 
     def _export_pdf(self, records, groups=None, mode="nezet", custom_title=None):
+        if self._export_running or self._logged_out or self._closing:
+            return
         if not records:
             info(self, "Export", "Nincsenek exportálandó engedélyek.")
             return
@@ -938,17 +1098,63 @@ class MainWindow(QMainWindow):
         if not path:
             return
         target = Path(path).parent / sanitize_filename(Path(path).name)
-        sites = self.data["telephelyek"]
-        try:
-            kwargs = {"mode": mode, "logo_path": str(self.logo_path) if self.logo_path.exists() else None,
-                      "telephely_meta": {s["nev"]: {"cim": s.get("cim") or "", "ktj": s.get("ktj") or ""} for s in sites}}
+        sites = copy.deepcopy(self.data["telephelyek"])
+        export_groups = copy.deepcopy(groups or {"Kiválasztott": records})
+        logo_path = Path(self.logo_path)
+        exporter = export_groups_pdf
+
+        def export():
+            kwargs = {
+                "mode": mode,
+                "logo_path": str(logo_path) if logo_path.exists() else None,
+                "telephely_meta": {
+                    site["nev"]: {"cim": site.get("cim") or "", "ktj": site.get("ktj") or ""}
+                    for site in sites
+                },
+            }
             if custom_title:
                 kwargs["custom_title"] = custom_title
-            export_groups_pdf(str(target), groups or {"Kiválasztott": records},
-                              {s["id"]: s["nev"] for s in sites}, **kwargs)
-            info(self, "Export", "Sikeres exportálás.")
-        except Exception as exc:
-            error(self, "Export", str(exc))
+            return exporter(
+                str(target), export_groups, {site["id"]: site["nev"] for site in sites}, **kwargs
+            )
+
+        self._run_export(export)
+
+    def _run_export(self, function):
+        if self._export_running or self._logged_out or self._closing:
+            return
+        from gui.workers import run_task
+        self._export_running = True
+        buttons = (self.btn_quick_tp, self.btn_quick_kat, self.btn_excel)
+        for button in buttons:
+            button.setEnabled(False)
+        service = self.service
+
+        def work():
+            service.snapshot()
+            return function()
+
+        def finish():
+            self._export_running = False
+            for button in buttons:
+                button.setEnabled(True)
+
+        def done(_):
+            finish()
+            if not self._logged_out and not self._closing:
+                info(self, "Export", "Sikeres exportálás.")
+
+        def failed(exc):
+            finish()
+            if self._logged_out or self._closing:
+                return
+            from core.auth import AuthenticationError
+            if isinstance(exc, AuthenticationError):
+                self.logout()
+            else:
+                error(self, "Export", str(exc))
+
+        run_task(self, work, done, failed)
 
     def _export_multiple_records(self, records):
         self._export_pdf(records)
@@ -976,6 +1182,8 @@ class MainWindow(QMainWindow):
         return None
 
     def batch_export(self, mode):
+        if self._export_running or self._logged_out or self._closing:
+            return
         records = self._get_filtered_items()
         sites = self.data["telephelyek"]
         choices = [s["nev"] for s in sites] if mode == "telephely" else FIX_KATEGORIAK
@@ -991,16 +1199,23 @@ class MainWindow(QMainWindow):
         self._export_pdf([r for group in groups.values() for r in group], groups, mode)
 
     def export_to_excel(self):
+        if self._export_running or self._logged_out or self._closing:
+            return
         records = self._get_filtered_items()
         if not records:
             return
         path, _ = QFileDialog.getSaveFileName(self, "Excel mentése", f"export_{date.today():%Y%m%d}.xlsx", "Excel (*.xlsx)")
-        if path:
-            try:
-                export_excel_fn(path, records, self.data["telephelyek"])
-                info(self, "Export", "Sikeres exportálás.")
-            except Exception as exc:
-                error(self, "Export", str(exc))
+        if not path:
+            return
+        export_records = copy.deepcopy(records)
+        sites = copy.deepcopy(self.data["telephelyek"])
+        options = {"include_archived": self.show_archived.isChecked()}
+        exporter = export_excel_fn
+
+        def export():
+            return exporter(path, export_records, sites, options=options)
+
+        self._run_export(export)
 
     def export_current_view(self):
         title, accepted = QInputDialog.getText(self, "Fejléc megadása", "Fejléc:")

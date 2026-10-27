@@ -90,8 +90,16 @@ class Session:
 
 @contextmanager
 def transaction(db):
-    with db.get_connection(immediate=True) as conn:
-        yield conn
+    try:
+        with db.get_connection(immediate=True) as conn:
+            yield conn
+    except sqlite3.OperationalError as exc:
+        from core.db import _is_busy
+        if _is_busy(exc):
+            raise ServiceError(
+                "Az adatbázis jelenleg foglalt vagy zárolt. A módosítás nem történt meg. "
+                "Várjon rövid ideig, frissítse az adatokat, majd próbálja újra.") from exc
+        raise
 
 
 def public_user(row):

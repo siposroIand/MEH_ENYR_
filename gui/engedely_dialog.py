@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QDate
 
 from config.app_config import get_ordered_categories
-from core.attachments import AttachmentPlan
+from core.attachments import ALLOWED_EXTENSIONS, AttachmentPlan
 from core.auth import ServiceError
 from utils.reviews import parse_reviews, next_review_date, ReviewValidationError
 from gui.workers import run_task
@@ -942,6 +942,16 @@ class EngedelyDialog(QDialog):
             QMessageBox.warning(self, "Hiba", "Fájl nem található.")
             self.load_attachments()
             return
+        if fpath.suffix.lower() not in ALLOWED_EXTENSIONS:
+            answer = QMessageBox.question(
+                self, "Biztonsági figyelmeztetés",
+                "Ez egy régi, nem támogatott típusú csatolmány, amely programot is "
+                "futtathat. Csak megbízható forrásból származó fájlt nyisson meg.\n"
+                f"Biztosan megnyitja?\n{sel.text()}",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
         mime, _ = mimetypes.guess_type(str(fpath))
         if mime and mime.startswith("image"):
             try:

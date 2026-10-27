@@ -12,7 +12,7 @@ from core.auth import (
     PermissionDenied, ServiceError, ValidationError, Session, ROLE_LABELS,
     audit, public_user, transaction,
 )
-from core.attachments import AttachmentPlan, safe_attachment_path
+from core.attachments import AttachmentPlan, attachment_names, safe_attachment_path
 from utils.reviews import parse_reviews
 
 
@@ -159,8 +159,6 @@ class PermitService(AuthService):
             if not parsed.valid:
                 raise ValidationError("; ".join(parsed.errors))
             reviews = normalize_reviews(list(parsed.entries))
-            if kind != "fixed" and any(item["type"] == "before_expiry" for item in reviews):
-                raise ValidationError("Lejárat előtti felülvizsgálat csak határozott hatályhoz adható.")
             values["felulvizsgalatok"] = json.dumps(reviews, ensure_ascii=False)
         site_id = values.get("telephely_id")
         if not site_id or conn.execute("SELECT 1 FROM telephelyek WHERE id=?", (site_id,)).fetchone() is None:
@@ -197,6 +195,10 @@ class PermitService(AuthService):
                 raise PermissionDenied("Csak saját ügy hozható létre.")
             if new.get("responsible_user_id") is None:
                 new["responsible_user_id"] = user["id"]
+        if old is None or "hatarozatszam" in changes:
+            decision_number = new.get("hatarozatszam")
+            if not isinstance(decision_number, str) or not decision_number.strip():
+                raise ValidationError("A határozatszám megadása kötelező.")
         if old is None or new.get("responsible_user_id") != old["responsible_user_id"]:
             self._assignee(conn, new.get("responsible_user_id"))
         review_fields = {"felulvizsgalatok", "felulvizsgalat_nap", "felulvizsgalat_date",
@@ -240,7 +242,7 @@ class PermitService(AuthService):
                 attachment_plan.rollback()
             raise
         if attachment_plan is not None:
-            attachment_plan.finalize()
+            attachment_plan.finalize(committed=True)
             self._warnings.extend(attachment_plan.cleanup_warnings)
         return saved
 
@@ -363,21 +365,32 @@ class PermitService(AuthService):
         with transaction(self.db) as conn:
             self._current(conn)
             self._permit(conn, permit_id)
-            if self.attachments_root is None:
-                return []
-            with AttachmentPlan(self.attachments_root, permit_id) as plan:
-                return plan.list_names()
+        if self.attachments_root is None:
+            return []
+        return attachment_names(self.attachments_root, permit_id)
+
+    def count_attachments(self, ids):
+        ids = list(ids)
+        if ids:
+            ids = self._ids(ids)
+        with transaction(self.db) as conn:
+            self._current(conn)
+            for permit_id in ids:
+                self._permit(conn, permit_id)
+        if self.attachments_root is None:
+            return {permit_id: 0 for permit_id in ids}
+        return {permit_id: len(attachment_names(self.attachments_root, permit_id)) for permit_id in ids}
 
     def attachment_path(self, permit_id, filename):
         with transaction(self.db) as conn:
             self._current(conn)
             self._permit(conn, permit_id)
-            if self.attachments_root is None:
-                raise ValidationError("Nincs beállítva csatolmánykönyvtár.")
-            path = safe_attachment_path(self.attachments_root, permit_id, filename)
-            if not path.is_file():
-                raise ValidationError("A csatolmány nem található.")
-            return path
+        if self.attachments_root is None:
+            raise ValidationError("Nincs beállítva csatolmánykönyvtár.")
+        path = safe_attachment_path(self.attachments_root, permit_id, filename)
+        if not path.is_file():
+            raise ValidationError("A csatolmány nem található.")
+        return path
 
     def save_attachments(self, permit_id, attachment_plan, expected_version):
         return self.save_permit({"id": permit_id}, expected_version, attachment_plan)
@@ -396,16 +409,18 @@ class PermitService(AuthService):
     def list_backups(self):
         with transaction(self.db) as conn:
             self._current(conn, admin=True)
-            return self.db.list_backups()
+        return self.db.list_backups()
 
     def create_backup(self):
         with transaction(self.db) as conn:
             user = self._current(conn, admin=True)
-            path = self.db.make_backup(reason="manual")
-            if path is None:
-                raise ServiceError("A biztonsági mentés nem készült el.")
-            audit(conn, user["id"], "backup_created", details={"filename": path.name})
-            return path
+            actor_id = user["id"]
+        path = self.db.make_backup(reason="manual")
+        if path is None:
+            raise ServiceError("A biztonsági mentés nem készült el.")
+        with transaction(self.db) as conn:
+            audit(conn, actor_id, "backup_created", details={"filename": path.name})
+        return path
 
     def restore_backup(self, backup_path):
         with transaction(self.db) as conn:
