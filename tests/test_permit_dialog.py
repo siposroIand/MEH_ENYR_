@@ -9,7 +9,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDate, Qt
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QTabWidget
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QTabWidget, QTextEdit
 
 from core.document_ocr import DocumentFields
 from gui.engedely_dialog import EngedelyDialog
@@ -125,6 +125,46 @@ class PermitDialogTests(unittest.TestCase):
         self.assertTrue(self.dialog.rb_indef.isChecked())
         self.assertIn("nem írtuk felül", self.dialog.ocr_status.text())
 
+    def test_new_fields_and_full_text_are_available_after_whole_document_read(self):
+        result = DocumentFields(
+            subject="Engedély", expiry=date(2030, 12, 31), validity="fixed",
+            authority="Minta Hatóság", issued_on=date(2026, 11, 1), decision_number="PE/12/2026",
+            text="--- 1. oldal ---\nTeljes <eredeti> szöveg\n--- 2. oldal ---\nUtolsó sor.",
+        )
+        with patch("gui.ocr_worker.read_document", return_value=result):
+            self.dialog._start_ocr([self.root / "example.pdf"])
+            self.wait_for_worker()
+        data = self.dialog.get_data()
+        self.assertEqual(data["kiado_hatosag"], "Minta Hatóság")
+        self.assertEqual(data["letrejott"], "2026-11-01")
+        self.assertEqual(data["hatarozatszam"], "PE/12/2026")
+        self.assertEqual(data["engedely_nev"], "Engedély")
+        self.assertEqual(data["lejarat"], "2030-12-31")
+        self.assertTrue(self.dialog.ocr_text_btn.isEnabled())
+        with patch("gui.engedely_dialog.QDialog.exec", return_value=QDialog.Rejected):
+            self.dialog._show_recognized_text()
+        text = self.dialog.findChild(QTextEdit, "ocrFullText")
+        self.assertTrue(text.isReadOnly())
+        self.assertIn("Teljes <eredeti> szöveg", text.toPlainText())
+        self.assertIn("Utolsó sor.", text.toPlainText())
+
+    def test_manual_authority_date_and_decision_changes_during_ocr_are_preserved(self):
+        def recognize(*args, **kwargs):
+            time.sleep(.05)
+            return DocumentFields(authority="OCR Hatóság", issued_on=date(2026, 11, 1), decision_number="OCR/2026")
+
+        with patch("gui.ocr_worker.read_document", side_effect=recognize):
+            self.dialog._start_ocr([self.root / "example.pdf"])
+            self.dialog.kiado.setText("Kézi Hatóság")
+            self.dialog.hatarozatszam.setText("KEZI/2026")
+            self.dialog.keltezes_cb.setChecked(True)
+            self.dialog.keltezes_date.setDate(QDate(2025, 2, 3))
+            self.wait_for_worker()
+        self.assertEqual(self.dialog.get_data()["kiado_hatosag"], "Kézi Hatóság")
+        self.assertEqual(self.dialog.get_data()["hatarozatszam"], "KEZI/2026")
+        self.assertEqual(self.dialog.get_data()["letrejott"], "2025-02-03")
+        self.assertIn("nem írtuk felül", self.dialog._recognized_text)
+
     def test_ocr_does_not_truncate_long_subject(self):
         self.dialog._ocr_revisions = (self.dialog._subject_revision, self.dialog._validity_revision)
         self.dialog._apply_ocr(DocumentFields(subject="x" * 201), [])
@@ -149,7 +189,7 @@ class PermitDialogTests(unittest.TestCase):
         source = self.root / "permit.png"
         source.write_bytes(b"fixture")
 
-        def delayed_result(*args):
+        def delayed_result(*args, **kwargs):
             time.sleep(0.05)
             return DocumentFields(subject="Must not apply")
 

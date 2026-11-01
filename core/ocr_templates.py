@@ -11,7 +11,10 @@ from threading import RLock
 from uuid import UUID, uuid4
 
 
-FIELD_LABELS = {"subject": "Tárgy", "validity": "Hatály / lejárat"}
+FIELD_LABELS = {
+    "subject": "Tárgy", "validity": "Hatály / lejárat",
+    "authority": "Kiadó hatóság", "issued_on": "Keltezés", "decision_number": "Határozatszám",
+}
 # PDFium must not be called concurrently by the editor and recognition workers.
 PDFIUM_LOCK = RLock()
 

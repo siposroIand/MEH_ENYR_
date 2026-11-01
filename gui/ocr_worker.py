@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 class OcrWorker(QThread):
     result_ready = Signal(object, object)
+    progress = Signal(str, int, int)
 
     def __init__(self, paths: list[Path], parent=None, *, template: OcrTemplate | None = None):
         super().__init__(parent)
@@ -26,12 +27,10 @@ class OcrWorker(QThread):
             if self.isInterruptionRequested():
                 return
             try:
-                if self.template is None:
-                    results.append(read_document(path, self.isInterruptionRequested))
-                else:
-                    results.append(read_document(
-                        path, self.isInterruptionRequested, template=self.template,
-                    ))
+                results.append(read_document(
+                    path, self.isInterruptionRequested, template=self.template,
+                    progress=lambda page, total, name=path.name: self.progress.emit(name, page, total),
+                ))
             except DocumentReadCancelled:
                 return
             except DocumentReadError as exc:

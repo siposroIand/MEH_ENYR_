@@ -136,16 +136,19 @@ class MainWindowSaveTests(unittest.TestCase):
             self.assertIs(builder.call_args.kwargs["data"], snapshot)
             self.assertIs(export.call_args.args[2], snapshot)
 
-    def test_approved_ai_fields_persist_in_existing_permit_columns(self):
-        self.dialog._apply_ai_fields({
-            "authority": "Minta Hatóság", "issued_on": "2026-01-15",
-            "validity": "2031-06-30", "subject": "AI-javaslat alapján ellenőrzött tárgy",
-        }, self.dialog._ai_snapshot())
+    def test_whole_document_ocr_fields_are_saved_in_existing_columns(self):
+        self.dialog._ocr_revisions = (self.dialog._subject_revision, self.dialog._validity_revision)
+        self.dialog._ocr_extra_revisions = self.dialog._extra_revisions.copy()
+        self.dialog._apply_ocr(DocumentFields(
+            subject="Teljes dokumentumból", expiry=date(2031, 6, 30), validity="fixed",
+            authority="Minta Hatóság", issued_on=date(2026, 11, 1), decision_number="PE/12/2026",
+        ), [])
         with patch("gui.main_window.EngedelyDialog", return_value=self.dialog):
             with patch.object(self.dialog, "exec", return_value=QDialog.Accepted):
                 self.window.add_engedely()
         stored = self.window.db.get_all_data()["engedelyek"][0]
         self.assertEqual(stored["kiado_hatosag"], "Minta Hatóság")
-        self.assertEqual(stored["letrejott"], "2026-01-15")
+        self.assertEqual(stored["letrejott"], "2026-11-01")
+        self.assertEqual(stored["hatarozatszam"], "PE/12/2026")
+        self.assertEqual(stored["engedely_nev"], "Teljes dokumentumból")
         self.assertEqual(stored["lejarat"], "2031-06-30")
-        self.assertEqual(stored["engedely_nev"], "AI-javaslat alapján ellenőrzött tárgy")

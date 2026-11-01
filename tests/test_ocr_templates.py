@@ -9,7 +9,7 @@ from uuid import uuid4
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from core.document_ocr import DocumentReadCancelled, extract_region_fields, read_document
+from core.document_ocr import DocumentReadCancelled, DocumentReadError, extract_region_fields, read_document
 from core.ocr_templates import (
     OcrRegion, OcrTemplate, TemplateStore, document_page_count, render_document_page,
 )
@@ -83,6 +83,12 @@ class TemplateModelTests(FileTestCase):
 
 
 class RegionExtractionTests(unittest.TestCase):
+    def test_new_fields_support_labelled_and_value_only_regions(self):
+        self.assertEqual(extract_region_fields("authority", "Minta Hatóság").authority, "Minta Hatóság")
+        self.assertEqual(extract_region_fields("issued_on", "2026. november 1.").issued_on, date(2026, 11, 1))
+        self.assertEqual(extract_region_fields("decision_number", "Ügyiratszám: PE/12/2026").decision_number, "PE/12/2026")
+        self.assertIsNone(extract_region_fields("issued_on", "Hatályos: 2030.01.01.").issued_on)
+
     def test_value_only_and_labelled_fields(self):
         for text in ("Engedély\nmódosítása", "Tárgy: Engedély módosítása"):
             self.assertEqual(extract_region_fields("subject", text).subject, "Engedély módosítása")
@@ -115,7 +121,7 @@ class TemplateReadingTests(FileTestCase):
             image.save(path)
         return path
 
-    def test_only_selected_crops_are_ocrd(self):
+    def test_full_page_and_selected_crops_are_ocrd(self):
         path = self.make_image()
         template = self.template(
             OcrRegion("subject", 1, (0.1, 0.1, 0.6, 0.3)),
@@ -125,16 +131,21 @@ class TemplateReadingTests(FileTestCase):
 
         def recognize(image, **kwargs):
             sizes.append(image.size)
+            if "config" not in kwargs:
+                self.assertEqual(kwargs, {"lang": "hun", "timeout": 45})
+                return "Kiadó hatóság: Minta Hatóság\nKelt: 2026.11.01."
             self.assertEqual(kwargs, {"lang": "hun", "timeout": 45, "config": "--psm 6"})
-            return "Engedély" if len(sizes) == 1 else "2030.12.31."
+            return "Engedély" if len(sizes) == 2 else "2030.12.31."
 
         with patch("pytesseract.image_to_string", side_effect=recognize):
             fields = read_document(path, template=template)
-        self.assertEqual(sizes, [(500, 160), (400, 80)])
+        self.assertEqual(sizes, [(1000, 800), (500, 160), (400, 80)])
         self.assertEqual(fields.subject, "Engedély")
         self.assertEqual(fields.expiry, date(2030, 12, 31))
+        self.assertEqual(fields.authority, "Minta Hatóság")
+        self.assertEqual(fields.issued_on, date(2026, 11, 1))
 
-    def test_real_local_ocr_reads_value_only_regions_not_outside_labels(self):
+    def test_real_local_ocr_does_not_hide_conflicting_full_page_values(self):
         from PIL import Image, ImageDraw, ImageFont
         import reportlab
         font = ImageFont.truetype(str(Path(reportlab.__file__).parent / "fonts/Vera.ttf"), 44)
@@ -153,8 +164,10 @@ class TemplateReadingTests(FileTestCase):
                     path = self.root / f"real.{extension}"
                     image.save(path)
                     fields = read_document(path, template=template)
-                    self.assertEqual(fields.subject, "Hulladékgazdálkodási engedély")
-                    self.assertEqual(fields.expiry, date(2030, 12, 31))
+                    self.assertIsNone(fields.subject)
+                    self.assertIsNone(fields.expiry)
+                    self.assertIn("subject", fields.blocked_fields)
+                    self.assertIn("validity", fields.blocked_fields)
 
     def test_unconfigured_field_is_not_filled_from_crop(self):
         path = self.make_image()
@@ -170,17 +183,16 @@ class TemplateReadingTests(FileTestCase):
             OcrRegion("subject", 2, (0, 0, 1, 0.5)),
             OcrRegion("validity", 1, (0, 0.5, 1, 1)),
         )
-        with patch("pytesseract.image_to_string", side_effect=["Engedély", "2030.12.31."]):
+        with patch("pytesseract.image_to_string", side_effect=["", "Engedély", "2030.12.31."]):
             fields = read_document(path, template=template)
         self.assertIsNone(fields.subject)
         self.assertEqual(fields.expiry, date(2030, 12, 31))
         self.assertTrue(any("2." in warning for warning in fields.warnings))
         with patch("pytesseract.image_to_string", side_effect=RuntimeError("OCR timeout")):
-            fields = read_document(path, template=template)
-        self.assertIsNone(fields.validity)
-        self.assertTrue(any("sikertelen" in warning for warning in fields.warnings))
+            with self.assertRaises(DocumentReadError):
+                read_document(path, template=template)
 
-    def test_multipage_pdf_and_tiff_use_requested_page_only(self):
+    def test_multipage_pdf_and_tiff_read_all_pages_before_requested_region(self):
         from PIL import Image
         for extension in ("tiff", "pdf"):
             with self.subTest(extension=extension):
@@ -194,13 +206,16 @@ class TemplateReadingTests(FileTestCase):
                 template = self.template(OcrRegion("subject", 2, (0.1, 0.1, 0.5, 0.3)))
 
                 def recognize(image, **kwargs):
+                    if "config" not in kwargs:
+                        return "Kiadó hatóság: Minta Hatóság" if image.getpixel((10, 10)) == (255, 255, 255) else ""
                     self.assertEqual(image.getpixel((10, 10)), (0, 0, 0))
                     return "Második oldal"
 
                 with patch("pytesseract.image_to_string", side_effect=recognize) as ocr:
                     fields = read_document(path, template=template)
                 self.assertEqual(fields.subject, "Második oldal")
-                self.assertEqual(ocr.call_count, 1)
+                self.assertEqual(fields.authority, "Minta Hatóság")
+                self.assertEqual(ocr.call_count, 3)
 
     def test_exif_orientation_matches_preview_and_ocr(self):
         from PIL import Image
@@ -214,6 +229,9 @@ class TemplateReadingTests(FileTestCase):
         template = self.template(OcrRegion("subject", 1, (0, 0, 0.5, 1)))
 
         def recognize(image, **kwargs):
+            if "config" not in kwargs:
+                self.assertEqual(image.size, (400, 600))
+                return ""
             self.assertEqual(image.size, (200, 600))
             return "Forgatott oldal"
 
@@ -229,7 +247,7 @@ class TemplateReadingTests(FileTestCase):
             OcrRegion("subject", 1, (0, 0, 1, 1)),
             OcrRegion("subject", 2, (0, 0, 1, 1)),
         )
-        with patch("pytesseract.image_to_string", side_effect=["Első", "Második"]):
+        with patch("pytesseract.image_to_string", side_effect=["", "", "Első", "Második"]):
             self.assertIsNone(read_document(path, template=template).subject)
         stopped = False
 

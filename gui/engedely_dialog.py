@@ -30,8 +30,7 @@ from PySide6.QtCore import Qt, QDate
 
 from config.app_config import get_ordered_categories
 from core.document_ocr import DocumentFields, SUPPORTED_EXTENSIONS
-from core.document_ai import AiClient, FIELD_LABELS, OpenAiClient
-from gui.document_ai_dialog import DocumentAiDialog
+from core.ocr_templates import FIELD_LABELS
 from gui.ocr_worker import OcrWorker
 from gui.ocr_templates import OcrTemplateSelector
 from utils.fs_utils import safe_copy_to_dir, validate_attachment, attachment_write_lock
@@ -190,7 +189,6 @@ class EngedelyDialog(QDialog):
         telephelyek: Optional[List[dict]] = None,
         hatosag_lista: Optional[List[str]] = None,
         attachments_base: Optional[str] = None,
-        ai_client: AiClient | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Engedély adatlap")
@@ -198,7 +196,6 @@ class EngedelyDialog(QDialog):
         self.resize(1100, 720)
 
         self.engedely = engedely or {}
-        self.ai_client = ai_client if ai_client is not None else OpenAiClient()
         self.temp_id = str(uuid4())
         self.attachments_base = Path(attachments_base) if attachments_base else Path.cwd() / "attachment"
         self._staging_dir = self.attachments_base / f"temp_{self.temp_id}"
@@ -208,6 +205,9 @@ class EngedelyDialog(QDialog):
         self._pending_close: Optional[int] = None
         self._subject_revision = 0
         self._validity_revision = 0
+        self._extra_revisions = {"authority": 0, "issued_on": 0, "decision_number": 0}
+        self._ocr_extra_revisions = self._extra_revisions.copy()
+        self._recognized_text = ""
 
         # internal list of felulvizsgalat entries: list of typed dicts
         self.felulvizsgalatok: List[Dict[str, Any]] = []
@@ -221,6 +221,10 @@ class EngedelyDialog(QDialog):
         self.hatary_date.dateChanged.connect(self._validity_changed)
         for radio in (self.rb_fixed, self.rb_indef, self.rb_until_mod):
             radio.toggled.connect(self._validity_changed)
+        self.kiado.textChanged.connect(lambda *_: self._extra_changed("authority"))
+        self.hatarozatszam.textChanged.connect(lambda *_: self._extra_changed("decision_number"))
+        self.keltezes_date.dateChanged.connect(lambda *_: self._extra_changed("issued_on"))
+        self.keltezes_cb.toggled.connect(lambda *_: self._extra_changed("issued_on"))
         # enable waste tab initially depending on category
         self.on_category_changed(self.kategoria.currentText())
 
@@ -454,10 +458,10 @@ class EngedelyDialog(QDialog):
         self.attach_del = QPushButton("Fájl törlése")
         self.attach_view = QPushButton("Megtekintés")
         self.attach_ocr = QPushButton("Újrafelismerés")
-        self.attach_ocr.setToolTip("A kijelölt fájl felismerése az aktuális OCR-sablonnal.")
-        self.attach_ai = QPushButton("AI-kitöltés…")
-        self.attach_ai.setToolTip("OpenAI: hatóság, keltezés, hatály és tárgy. Csak külön küldési és mezőátvételi jóváhagyással.")
-        for button in (self.attach_add, self.attach_toggle, self.attach_view, self.attach_ocr, self.attach_ai, self.attach_del):
+        self.attach_ocr.setToolTip("A kijelölt fájl összes oldalának helyi felismerése; a sablon csak kiegészítés.")
+        self.ocr_text_btn = QPushButton("Felismert szöveg…")
+        self.ocr_text_btn.setEnabled(False)
+        for button in (self.attach_add, self.attach_toggle, self.attach_view, self.attach_ocr, self.ocr_text_btn, self.attach_del):
             att_toolbar.addWidget(button)
         att_toolbar.addStretch()
         att_layout.addLayout(att_toolbar)
@@ -469,10 +473,12 @@ class EngedelyDialog(QDialog):
         self.attach_del.clicked.connect(self.remove_attachment)
         self.attach_view.clicked.connect(self.view_attachment)
         self.attach_ocr.clicked.connect(self._recognize_selected_attachment)
-        self.attach_ai.clicked.connect(self._recognize_with_ai)
+        self.ocr_text_btn.clicked.connect(self._show_recognized_text)
         gen_layout.addWidget(att_w)
-        self.ocr_status = QLabel("PDF vagy kép tallózásakor a tárgy és a hatály automatikusan kitöltődik.")
+        self.ocr_status = QLabel("Teljes dokumentumolvasás: tárgy, hatóság, keltezés, hatály és határozatszám felismerése helyben.")
+        self.ocr_status.setTextFormat(Qt.PlainText)
         self.ocr_status.setWordWrap(True)
+        self.ocr_status.setMaximumHeight(64)
         gen_layout.addWidget(self.ocr_status)
 
         # buttons (Save/Cancel)
@@ -853,55 +859,6 @@ class EngedelyDialog(QDialog):
         self.attach_ocr.setEnabled(
             self._ocr_worker is None and path is not None and path.suffix.lower() in SUPPORTED_EXTENSIONS
         )
-        self.attach_ai.setEnabled(self.attach_ocr.isEnabled())
-
-    def _ai_snapshot(self) -> dict:
-        return {
-            "authority": self.kiado.text(), "subject": self.targy.text(),
-            "issued_on": (self.keltezes_cb.isChecked(), qdate_to_iso(self.keltezes_date.date())),
-            "validity": (self.rb_fixed.isChecked(), self.rb_indef.isChecked(),
-                         self.rb_until_mod.isChecked(), qdate_to_iso(self.hatary_date.date())),
-        }
-
-    def _recognize_with_ai(self) -> None:
-        selected = self.attach_list.currentItem()
-        if self._ocr_worker is not None or selected is None or not self.attach_ai.isEnabled():
-            return
-        snapshot = self._ai_snapshot()
-        dialog = DocumentAiDialog(selected.data(Qt.UserRole), self.ai_client, self)
-        if dialog.exec() == QDialog.Accepted:
-            self._apply_ai_fields(dialog.selected_fields(), snapshot)
-        dialog.deleteLater()
-
-    def _apply_ai_fields(self, fields: dict[str, str], snapshot: dict) -> None:
-        current = self._ai_snapshot()
-        updated, warnings = [], []
-        for name, value in fields.items():
-            if current[name] != snapshot[name]:
-                warnings.append(f"{FIELD_LABELS[name]}: a közben módosított mezőt nem írtuk felül.")
-                continue
-            if name in ("authority", "subject"):
-                widget = self.kiado if name == "authority" else self.targy
-                if len(value) > widget.maxLength():
-                    warnings.append(f"{FIELD_LABELS[name]}: túl hosszú érték, kézzel adja meg.")
-                    continue
-                widget.setText(value)
-            elif name == "validity" and value in ("indefinite", "until_modified"):
-                (self.rb_indef if value == "indefinite" else self.rb_until_mod).setChecked(True)
-            else:
-                widget = self.keltezes_date if name == "issued_on" else self.hatary_date
-                parsed = iso_to_qdate(value)
-                if parsed is None or not widget.minimumDate() <= parsed <= widget.maximumDate():
-                    warnings.append(f"{FIELD_LABELS[name]}: érvénytelen vagy tartományon kívüli dátum.")
-                    continue
-                widget.setDate(parsed)
-                if name == "issued_on":
-                    self.keltezes_cb.setChecked(True)
-                else:
-                    self.rb_fixed.setChecked(True)
-            updated.append(FIELD_LABELS[name])
-        message = f"AI-javaslat átvéve: {', '.join(updated)}. Az adatlap még nincs mentve." if updated else "Nem vettünk át AI-javaslatot."
-        self.ocr_status.setText("\n".join([message, *warnings]))
 
     def _recognize_selected_attachment(self) -> None:
         selected = self.attach_list.currentItem()
@@ -941,13 +898,40 @@ class EngedelyDialog(QDialog):
     def _validity_changed(self, *_args) -> None:
         self._validity_revision += 1
 
+    def _extra_changed(self, field: str) -> None:
+        self._extra_revisions[field] += 1
+
+    def _show_recognized_text(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Teljes felismert szöveg – helyi OCR")
+        dialog.resize(900, 650)
+        layout = QVBoxLayout(dialog)
+        text = QTextEdit()
+        text.setObjectName("ocrFullText")
+        text.setReadOnly(True)
+        text.setPlainText(self._recognized_text)
+        layout.addWidget(text)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def _ocr_progress(self, name: str, page: int, total: int) -> None:
+        if self._pending_close is None:
+            self.ocr_status.setText(f"{name}: {page}/{total}. oldal feldolgozása helyben…")
+
     def _start_ocr(self, paths: List[Path]) -> None:
         self._ocr_revisions = (self._subject_revision, self._validity_revision)
+        self._ocr_extra_revisions = self._extra_revisions.copy()
+        self._recognized_text = ""
+        self.ocr_text_btn.setEnabled(False)
         self.ocr_status.setText("Dokumentumok feldolgozása… Az adatmezők közben szerkeszthetők.")
-        for button in (self.attach_add, self.attach_del, self.attach_ocr, self.attach_ai, self.save_btn, self.ocr_template_selector):
+        for button in (self.attach_add, self.attach_del, self.attach_ocr, self.save_btn, self.ocr_template_selector):
             button.setEnabled(False)
         self._ocr_worker = OcrWorker(paths, self, template=self.ocr_template_selector.selected_template())
         self._ocr_worker.result_ready.connect(self._apply_ocr)
+        self._ocr_worker.progress.connect(self._ocr_progress)
         self._ocr_worker.finished.connect(self._ocr_finished)
         self._ocr_worker.start()
 
@@ -956,6 +940,27 @@ class EngedelyDialog(QDialog):
             return
         messages = list(fields.warnings)
         updated = []
+        for name, widget in (("authority", self.kiado), ("decision_number", self.hatarozatszam)):
+            value = getattr(fields, name)
+            if not value:
+                continue
+            if self._extra_revisions[name] != self._ocr_extra_revisions[name]:
+                messages.append(f"{FIELD_LABELS[name]}: a kézzel módosított mezőt nem írtuk felül.")
+            elif len(value) > widget.maxLength():
+                messages.append(f"{FIELD_LABELS[name]}: túl hosszú találat; ellenőrizze kézzel.")
+            else:
+                widget.setText(value)
+                updated.append(FIELD_LABELS[name])
+        if fields.issued_on:
+            value = QDate(fields.issued_on.year, fields.issued_on.month, fields.issued_on.day)
+            if self._extra_revisions["issued_on"] != self._ocr_extra_revisions["issued_on"]:
+                messages.append("Keltezés: a kézzel módosított mezőt nem írtuk felül.")
+            elif self.keltezes_date.minimumDate() <= value <= self.keltezes_date.maximumDate():
+                self.keltezes_date.setDate(value)
+                self.keltezes_cb.setChecked(True)
+                updated.append("keltezés")
+            else:
+                messages.append("A felismert keltezés az engedélyezett tartományon kívül esik.")
         if fields.subject:
             if self._subject_revision != self._ocr_revisions[0]:
                 messages.append("A kézzel módosított tárgyat nem írtuk felül.")
@@ -985,14 +990,19 @@ class EngedelyDialog(QDialog):
             messages.insert(0, f"Kitöltve: {', '.join(updated)}. Mentés előtt ellenőrizze a felismert adatokat.")
         else:
             messages.insert(0, "Nem történt automatikus kitöltés; a mezők kézzel megadhatók.")
-        if not fields.subject:
-            messages.append("Nem található egyértelmű „Tárgy:” érték.")
-        if not fields.validity:
-            messages.append("Nem található egyértelmű „Hatályos:” vagy „Érvényes:” érték.")
+        missing = [label for field, label in FIELD_LABELS.items() if not getattr(fields, field)]
+        if missing:
+            messages.append("Nem található egyértelmű érték: " + ", ".join(missing) + ".")
         if errors:
             messages.append("Egyes dokumentumok felismerése sikertelen.")
+            messages[0] += " Egyes dokumentumok felismerése sikertelen."
             QMessageBox.warning(self, "OCR", "\n\n".join(errors))
-        self.ocr_status.setText("\n".join(messages))
+        self._recognized_text = "\n\n".join(part for part in (
+            fields.text, "Feldolgozási üzenetek:\n" + "\n".join(messages), "\n\n".join(errors),
+        ) if part)
+        self.ocr_text_btn.setEnabled(True)
+        self.ocr_status.setToolTip("\n".join(messages))
+        self.ocr_status.setText("\n".join(messages[:2]) + "\nRészletek: Felismert szöveg…")
 
     def _ocr_finished(self) -> None:
         worker = self._ocr_worker

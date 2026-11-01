@@ -10,10 +10,8 @@ import os
 from pathlib import Path
 import sqlite3
 import ssl
-from threading import BoundedSemaphore
 
 from core.db import ConflictError, Database
-from core.document_ai import AiError, MAX_AI_REQUEST_BYTES, OpenAiClient
 
 logger = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
@@ -61,8 +59,6 @@ class DatabaseServer(ThreadingHTTPServer):
         if len(token) < 32 or not token.isascii() or any(c.isspace() for c in token):
             raise ValueError("A MEH_SERVER_TOKEN legalább 32 karakteres, szóköz nélküli ASCII-kulcs legyen.")
         self.database = database
-        self.ai_client = OpenAiClient()
-        self.ai_slots = BoundedSemaphore(2)
         self.auth = ("Bearer " + token).encode("ascii")
         super().__init__(address, DatabaseHandler)
 
@@ -84,7 +80,7 @@ class DatabaseHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if self.path not in ("/api", "/ai"):
+        if self.path != "/api":
             self._reply(404, {"error": "Ismeretlen végpont."})
             return
         if not compare_digest(self.headers.get("Authorization", "").encode("utf-8"), self.server.auth):
@@ -92,8 +88,7 @@ class DatabaseHandler(BaseHTTPRequestHandler):
             return
         try:
             size = int(self.headers.get("Content-Length", "0"))
-            limit = MAX_AI_REQUEST_BYTES if self.path == "/ai" else MAX_REQUEST_BYTES
-            if not 0 < size <= limit:
+            if not 0 < size <= MAX_REQUEST_BYTES:
                 self._reply(413, {"error": "Érvénytelen kérésméret."})
                 return
             request = json.loads(self.rfile.read(size))
@@ -102,19 +97,7 @@ class DatabaseHandler(BaseHTTPRequestHandler):
             method, params = request.get("method"), request.get("params", {})
             if not isinstance(method, str) or not isinstance(params, dict):
                 raise ValueError("Érvénytelen művelet.")
-            if self.path == "/ai":
-                if method == "ai_capabilities" and not params:
-                    result = self.server.ai_client.ai_capabilities()
-                elif method == "ai_extract" and set(params) == {"images", "consent"}:
-                    if not self.server.ai_slots.acquire(blocking=False):
-                        raise AiError("Két AI-feldolgozás már folyamatban van. Próbálja később újra.")
-                    try:
-                        result = self.server.ai_client.ai_extract(**params).to_dict()
-                    finally:
-                        self.server.ai_slots.release()
-                else:
-                    raise ValueError("Nem engedélyezett AI-művelet.")
-            elif method == "health":
+            if method == "health":
                 result = {"version": 1}
             elif method in METHODS:
                 _validate_params(method, params)
@@ -125,9 +108,6 @@ class DatabaseHandler(BaseHTTPRequestHandler):
                     result = result.name
             else:
                 raise ValueError("Nem engedélyezett művelet.")
-        except AiError as exc:
-            logger.warning("AI operation rejected or failed: %s", exc)
-            self._reply(422, {"error": str(exc)})
         except ConflictError as exc:
             self._reply(409, {"error": str(exc)})
         except sqlite3.IntegrityError as exc:

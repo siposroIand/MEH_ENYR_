@@ -1420,8 +1420,7 @@ class MainWindow(QMainWindow):
         if not self.data.get("telephelyek"):
             warning(self, DIALOG_ENGEDELY_TITLE, "Nincs telephely!")
             return
-        dlg = EngedelyDialog(self, engedely=None, telephelyek=self.data["telephelyek"], hatosag_lista=self.get_hatosag_suggestions(), attachments_base=str(self.ATTACHMENTS_DIR),
-                             ai_client=self.db if getattr(self.db, "is_remote", False) else None)
+        dlg = EngedelyDialog(self, engedely=None, telephelyek=self.data["telephelyek"], hatosag_lista=self.get_hatosag_suggestions(), attachments_base=str(self.ATTACHMENTS_DIR))
         res = dlg.exec()
         if res == QDialog.Accepted:
             d = dlg.get_data()
@@ -1444,8 +1443,7 @@ class MainWindow(QMainWindow):
         if EngedelyDialog is None:
             error(self, "Engedély", "Engedély dialog nem elérhető (import hiba).")
             return
-        dlg = EngedelyDialog(self, eng, self.data.get("telephelyek", []), self.get_hatosag_suggestions(), attachments_base=str(self.ATTACHMENTS_DIR),
-                             ai_client=self.db if getattr(self.db, "is_remote", False) else None)
+        dlg = EngedelyDialog(self, eng, self.data.get("telephelyek", []), self.get_hatosag_suggestions(), attachments_base=str(self.ATTACHMENTS_DIR))
         res = dlg.exec()
         if res == QDialog.Accepted:
             d = dlg.get_data()

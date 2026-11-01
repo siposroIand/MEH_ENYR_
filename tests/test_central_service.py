@@ -18,7 +18,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from core.db import ConflictError, Database
 from core.db_service import DatabaseServer, MAX_REQUEST_BYTES
 from core.remote_db import RemoteDatabase, RemoteDatabaseError
-from core.document_ai import AiError, FIELDS, parse_result
 
 
 TOKEN = "test-only-token-" + "x" * 32
@@ -143,6 +142,13 @@ class CentralServiceTests(unittest.TestCase):
             urlopen(request, timeout=2)
         self.assertEqual(error.exception.code, 413)
 
+    def test_removed_external_processing_endpoint_is_not_available(self):
+        request = Request(self.url + "/ai", data=b"{}", method="POST",
+                          headers={"Authorization": f"Bearer {TOKEN}"})
+        with self.assertRaises(HTTPError) as error:
+            urlopen(request, timeout=2)
+        self.assertEqual(error.exception.code, 404)
+
     def test_network_failure_is_explicit_and_never_uses_local_storage(self):
         for failure in (OSError("offline"), IncompleteRead(b'{"res')):
             with self.subTest(failure=failure):
@@ -150,39 +156,6 @@ class CentralServiceTests(unittest.TestCase):
                     with self.assertRaisesRegex(RemoteDatabaseError, "bizonytalan"):
                         self.clients[0].save_permit(self.permit(), "permit")
         self.assertEqual(self.database.get_all_data()["engedelyek"], [])
-
-    def test_ai_uses_authenticated_server_client_without_revealing_provider_key(self):
-        data = {name: {"value": None, "status": "missing", "page": None, "evidence": None, "note": ""} for name in FIELDS}
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-server-key-not-real"}):
-            capabilities = self.clients[0].ai_capabilities()
-            self.assertTrue(capabilities["enabled"])
-            self.assertNotIn("test-server-key-not-real", str(capabilities))
-            with patch.object(self.server.ai_client, "ai_extract", return_value=parse_result(data, 1)) as extract:
-                result = self.clients[1].ai_extract(["synthetic-mocked-image"], True)
-            extract.assert_called_once_with(images=["synthetic-mocked-image"], consent=True)
-            self.assertEqual(result.subject.status, "missing")
-        self.assertEqual(self.database.get_all_data()["engedelyek"], [])
-
-    def test_ai_service_requires_consent_and_does_not_block_database_operations(self):
-        with patch("core.document_ai.build_opener") as provider:
-            with self.assertRaises(AiError):
-                self.clients[0]._call("ai_extract", images=["synthetic"], consent=False)
-            self.server.ai_slots.acquire()
-            self.server.ai_slots.acquire()
-            try:
-                with self.assertRaisesRegex(AiError, "folyamatban"):
-                    self.clients[0].ai_extract(["synthetic"], True)
-                self.assertEqual(len(self.clients[1].get_telephelyek()), 1)
-            finally:
-                self.server.ai_slots.release()
-                self.server.ai_slots.release()
-            provider.assert_not_called()
-
-    def test_ai_network_error_does_not_claim_a_database_write_or_retry(self):
-        with patch.object(self.clients[0]._opener, "open", side_effect=OSError("offline")) as request:
-            with self.assertRaisesRegex(AiError, "adatlap nem változott"):
-                self.clients[0].ai_extract(["synthetic"], True)
-            self.assertEqual(request.call_count, 1)
 
     def test_window_edits_through_remote_api_and_keeps_last_snapshot_on_failure(self):
         from PySide6.QtCore import QTimer
