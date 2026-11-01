@@ -10,6 +10,9 @@ import re
 from typing import Callable
 import unicodedata
 
+from core.ocr_templates import (
+    FIELD_LABELS, OcrTemplate, PDFIUM_LOCK, document_page_count, render_document_page,
+)
 
 SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 _LABEL = re.compile(r"(?i)\b(tárgy|targy|hatályos|hatalyos|érvényes|ervenyes)\s*:")
@@ -136,8 +139,54 @@ def merge_fields(results: list[DocumentFields]) -> DocumentFields:
     )
 
 
-def read_document(path: Path, cancelled: Callable[[], bool] = lambda: False) -> DocumentFields:
-    """Read native PDF text first, OCR scanned pages/images with Hungarian Tesseract."""
+def extract_region_fields(field: str, text: str) -> DocumentFields:
+    """A selected area supplies the field label, but never supplies missing evidence."""
+    value = unicodedata.normalize("NFC", text).strip()
+    if not value:
+        return DocumentFields(warnings=("A kijelölt területen nem található olvasható szöveg.",))
+    if field == "subject":
+        value = re.sub(r"(?i)^\s*t[áa]rgy\s*:\s*", "", value).strip()
+        if _LABEL.search(value) or any(_NEXT_FIELD.match(line) for line in value.splitlines()):
+            return DocumentFields(warnings=("A tárgy területe más mezőt is tartalmaz; szűkítse a kijelölést.",))
+        subject = " ".join(value.split())
+        if not subject or len(subject) > 200:
+            return DocumentFields(warnings=("A kijelölt tárgy üres vagy túl hosszú; ellenőrizze kézzel.",))
+        return DocumentFields(subject=subject)
+    if field != "validity":
+        raise ValueError("Ismeretlen sablonmező.")
+    value = re.sub(
+        r"(?i)^\s*(?:hat[áa]lyos|[ée]rv[ée]nyes|hat[áa]ly|lej[áa]rat)\s*:\s*", "", value
+    )
+    normalized = _fold(value)
+    has_date = _DATE.search(normalized) is not None
+    indefinite = re.search(r"\bhatarozatlan\b", normalized) is not None
+    until_modified = re.search(r"\b(?:visszavonasig|valtoztatasig|modositasig)\b", normalized) is not None
+    # Mixed conditions, unrelated labels and alternatives require human review.
+    if (
+        ":" in value
+        or sum((has_date, indefinite, until_modified)) > 1
+        or re.search(r"\b(?:vagy|kiveve|felt[eé]ve|nem)\b", normalized)
+    ):
+        return DocumentFields(warnings=("A kijelölt hatály nem egyértelmű; adja meg kézzel.",))
+    if indefinite or until_modified:
+        if not re.fullmatch(
+            r"(?:hatarozatlan(?:\s+(?:ideig|idore))?|visszavonasig|valtoztatasig|modositasig)[\s.]*",
+            normalized,
+        ):
+            return DocumentFields(warnings=("A kijelölt hatály feltételeket tartalmaz; ellenőrizze kézzel.",))
+    elif has_date:
+        remainder = _DATE.sub("", normalized)
+        remainder = re.sub(r"\b(?:tol|ig|napjaig|napjatol)\b", "", remainder)
+        if re.search(r"[^\s./–—-]", remainder):
+            return DocumentFields(warnings=("A kijelölt dátumhoz más szöveg tartozik; ellenőrizze kézzel.",))
+    return extract_fields("Érvényes: " + value)
+
+
+def read_document(
+    path: Path, cancelled: Callable[[], bool] = lambda: False,
+    *, template: OcrTemplate | None = None,
+) -> DocumentFields:
+    """Read labelled text automatically, or OCR only a template's explicit regions."""
     try:
         import pypdfium2 as pdfium
         import pytesseract
@@ -153,20 +202,67 @@ def read_document(path: Path, cancelled: Callable[[], bool] = lambda: False) -> 
         if cancelled():
             raise DocumentReadCancelled()
 
-    def ocr(image) -> str:
+    def ocr(image, *, region: bool = False) -> str:
         check_cancelled()
         with ImageOps.exif_transpose(image) as oriented:
             with oriented.convert("RGB") as prepared:
                 prepared.thumbnail((3500, 3500))
-                return pytesseract.image_to_string(prepared, lang="hun", timeout=45)
+                options = {"config": "--psm 6"} if region else {}
+                text = pytesseract.image_to_string(prepared, lang="hun", timeout=45, **options)
+                check_cancelled()
+                return text
 
     try:
         check_cancelled()
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             raise DocumentReadError("Ehhez a fájltípushoz nincs OCR-támogatás.")
         results = []
+        if template is not None:
+            unsafe_fields = set()
+            page_count = document_page_count(path)
+            for page_number in sorted({r.page for r in template.regions}):
+                check_cancelled()
+                regions = [r for r in template.regions if r.page == page_number]
+                if page_number > page_count:
+                    unsafe_fields.update(r.field for r in regions)
+                    results.append(DocumentFields(warnings=(
+                        f"A sablon {page_number}. oldala hiányzik; az ott kijelölt mezők nem olvashatók.",
+                    )))
+                    continue
+                with render_document_page(path, page_number, 3500) as image:
+                    for region in regions:
+                        check_cancelled()
+                        with image.crop(region.pixel_box(*image.size)) as cropped:
+                            try:
+                                fields = extract_region_fields(region.field, ocr(cropped, region=True))
+                            except DocumentReadCancelled:
+                                raise
+                            except (OSError, RuntimeError) as exc:
+                                fields = DocumentFields(warnings=(
+                                    f"A kijelölt mező OCR-je sikertelen: {exc}",
+                                ))
+                            if (
+                                (region.field == "subject" and not fields.subject)
+                                or (region.field == "validity" and not fields.validity)
+                            ):
+                                unsafe_fields.add(region.field)
+                            results.append(DocumentFields(
+                                fields.subject, fields.expiry, fields.validity,
+                                tuple(
+                                    f"{page_number}. oldal – {FIELD_LABELS[region.field]}: {warning}"
+                                    for warning in fields.warnings
+                                ),
+                            ))
+            check_cancelled()
+            merged = merge_fields(results)
+            return DocumentFields(
+                None if "subject" in unsafe_fields else merged.subject,
+                None if "validity" in unsafe_fields else merged.expiry,
+                None if "validity" in unsafe_fields else merged.validity,
+                merged.warnings,
+            )
         if path.suffix.lower() == ".pdf":
-            with closing(pdfium.PdfDocument(str(path))) as document:
+            with PDFIUM_LOCK, closing(pdfium.PdfDocument(str(path))) as document:
                 for index in range(len(document)):
                     check_cancelled()
                     with closing(document[index]) as page:

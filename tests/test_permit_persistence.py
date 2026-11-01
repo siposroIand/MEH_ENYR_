@@ -24,6 +24,7 @@ class PermitPersistenceTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.db = Database(Path(self.temp.name) / "records.db")
+        self.db.save_telephely({"nev": "Telephely"}, "site")
         self.owner = SimpleNamespace(db=self.db)
         self.data = {
             "telephely_id": "site", "engedely_nev": "OCR tárgy",
@@ -41,6 +42,7 @@ class PermitPersistenceTests(unittest.TestCase):
         self.assertEqual(json.loads(record["felulvizsgalatok"]), self.data["felulvizsgalatok"])
         self.data["felulvizsgalatok"] = []
         self.data["engedely_nev"] = "Updated"
+        self.data["revision"] = record["revision"]
         MainWindow._persist_permit(self.owner, self.data, "permit", "2026-01-02T12:00:00", updating=True)
         record = self.db.get_all_data()["engedelyek"][0]
         self.assertEqual(record["engedely_nev"], "Updated")
@@ -117,3 +119,19 @@ class MainWindowSaveTests(unittest.TestCase):
         record = self.window.db.get_all_data()["engedelyek"][0]
         self.assertEqual(record["engedely_nev"], "OCR tárgy")
         self.assertTrue((self.root / "attachments" / record["id"] / "permit.txt").exists())
+
+    def test_report_export_uses_same_snapshot_as_preview_during_remote_refresh(self):
+        snapshot = self.window.data
+        with patch("gui.main_window.ReportBuilderDialog") as builder:
+            dialog = builder.return_value
+            dialog.get_options.return_value = {"title": "Snapshot report"}
+
+            def refresh_while_open():
+                self.window.data = {"telephelyek": [], "engedelyek": []}
+                return QDialog.Accepted
+
+            dialog.exec.side_effect = refresh_while_open
+            with patch("gui.main_window.run_report") as export:
+                self.window.open_report_builder()
+            self.assertIs(builder.call_args.kwargs["data"], snapshot)
+            self.assertIs(export.call_args.args[2], snapshot)

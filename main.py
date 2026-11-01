@@ -5,10 +5,14 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QIcon
 
-from config.app_config import NETWORK_ROOT, DB_FILENAME, FAVICON_FILENAME, LOGO_FILENAME
+from config.app_config import (
+    NETWORK_ROOT, DB_FILENAME, FAVICON_FILENAME, LOGO_FILENAME,
+    SERVER_URL, SERVER_TOKEN, SERVER_CA_FILE,
+)
 from config.paths import build_app_dirs, get_resource_path
 from config.settings import LOG_LEVEL
 from core.db import Database
+from core.remote_db import RemoteDatabase
 from gui.app_ui import install_global_styles, set_windows_app_id
 from gui.ui_texts import (
     APP_TITLE,
@@ -51,7 +55,10 @@ def run_app() -> int:
 
     db_file = Path(dirs["db"]) / DB_FILENAME
     try:
-        db = Database(db_file, backup_dir=dirs["backup"])
+        if SERVER_URL:
+            db = RemoteDatabase(SERVER_URL, SERVER_TOKEN, SERVER_CA_FILE)
+        else:
+            db = Database(db_file, backup_dir=dirs["backup"])
     except Exception as e:
         QMessageBox.critical(
             None,

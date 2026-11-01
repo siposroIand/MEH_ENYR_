@@ -1,38 +1,16 @@
-from typing import List, Dict, Any, Optional, Union
+"""Report-builder exports with one shared column, ordering and formatting model."""
+from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
-from datetime import datetime, date, timedelta
-import os
-import logging
-import re
-import math
+from typing import Any
+from xml.sax.saxutils import escape
 import json
+import math
+import re
 
-logger = logging.getLogger(__name__)
+from core.report_data import parse_date, validity_type
 
-# ----------------- PDF deps -----------------
-try:
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, PageBreak, Image, Spacer, Paragraph, Frame
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib import colors
-    from reportlab.lib.colors import HexColor
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.lib.units import cm
-    PDF_ENABLED = True
-except Exception:
-    PDF_ENABLED = False
 
-# ----------------- Excel deps -----------------
-try:
-    import pandas as pd
-    from openpyxl.utils import get_column_letter
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    EXCEL_ENABLED = True
-except Exception:
-    EXCEL_ENABLED = False
-
-# ----------------- Default column defs -----------------
 ALL_COLUMNS = [
     ("telephely", "Telephely"),
     ("kategoria", "Engedélytípus"),
@@ -49,632 +27,329 @@ ALL_COLUMNS = [
     ("hulladek_nv_gyujt", "NV-Gyűjtés"),
     ("hulladek_v_gyujt", "V-Gyűjtés"),
 ]
-KEY_TO_HEADER = {k: h for k, h in ALL_COLUMNS}
+KEY_TO_HEADER = dict(ALL_COLUMNS)
+ALIASES = {"felulvizsgalat_date": "felulvizsgalat", "lejarat_display": "lejarat"}
 
-# ----------------- Helper functions -----------------
-def _register_fonts():
-    """Register fonts for Hungarian characters."""
-    candidates = [
-        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-        ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/arialbd.ttf"),
-        (str(Path(__file__).parent / "fonts/DejaVuSans.ttf"), str(Path(__file__).parent / "fonts/DejaVuSans-Bold.ttf"))
-    ]
-    for reg, regb in candidates:
-        if os.path.exists(reg) and os.path.exists(regb):
+
+def _render_str(value):
+    return "" if value is None else str(value)
+
+
+def _fmt_date_full(value):
+    parsed = parse_date(value)
+    return parsed.strftime("%Y.%m.%d") if parsed else _render_str(value)
+
+
+def _extract_review_entries(item):
+    raw = item.get("felulvizsgalatok")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw) if raw.strip() else []
+        except json.JSONDecodeError as exc:
+            raise ValueError("Hibás felülvizsgálati adatok: nem érvényes JSON.") from exc
+    if raw is not None and not isinstance(raw, list):
+        raise ValueError("Hibás felülvizsgálati adatok: lista szükséges.")
+    entries = []
+    for entry in raw or []:
+        if not isinstance(entry, dict):
+            raise ValueError("Hibás felülvizsgálati bejegyzés.")
+        if entry.get("type") == "before_expiry":
+            days = _review_days(entry.get("days"))
+            expiry = parse_date(item.get("lejarat")) if validity_type(item) == "fixed" else None
+            if expiry:
+                note = f"{days} nappal a lejárat előtt (számított)"
+                if entry.get("note"):
+                    note += " : " + str(entry["note"])
+                entries.append((expiry - timedelta(days=days), note))
+            continue
+        value = entry.get("date")
+        parsed = parse_date(value)
+        # Non-date review conditions are retained in the notes block.
+        if parsed:
+            entries.append((parsed, _render_str(entry.get("note"))))
+        elif value:
+            raise ValueError(f"Érvénytelen felülvizsgálati dátum: {value}")
+    if not entries and not raw:
+        single = parse_date(item.get("felulvizsgalat_date"))
+        if single:
+            entries.append((single, ""))
+    if not entries and not raw:
+        days = item.get("felulvizsgalat_nap")
+        expiry = parse_date(item.get("lejarat")) if validity_type(item) == "fixed" else None
+        if days not in (None, "", 0, "0") and expiry:
             try:
-                pdfmetrics.registerFont(TTFont("App-Regular", reg))
-                pdfmetrics.registerFont(TTFont("App-Bold", regb))
-                return "App-Regular", "App-Bold"
-            except Exception as ex:
-                logger.debug("Font reg failed: %s", ex)
-    return "Helvetica", "Helvetica-Bold"
+                days = int(days)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("Érvénytelen felülvizsgálati napérték.") from exc
+            if days > 0:
+                entries.append((expiry - timedelta(days=days), f"{days} nappal a lejárat előtt (számított)"))
+    return sorted(set(entries), key=lambda entry: (entry[0], entry[1]))
 
-REGULAR_FONT, BOLD_FONT = _register_fonts()
 
-def _fmt_date(value: Optional[Union[str, date]], fmt="%Y/%m") -> str:
-    # keep behavior: empty string stays empty; only None -> ""
-    if value is None:
-        return ""
-    if value == "":
-        return ""
+def _review_days(value):
     try:
-        if isinstance(value, date):
-            return value.strftime(fmt)
-        if isinstance(value, str) and "T" in value:
-            return datetime.fromisoformat(value).date().strftime(fmt)
-        return datetime.strptime(value, "%Y.%m.%d").date().strftime(fmt)
-    except Exception:
-        # fallback to string representation (but not "None")
-        try:
-            return str(value)
-        except Exception:
-            return ""
+        days = int(value)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Érvénytelen felülvizsgálati napérték.") from exc
+    if days <= 0:
+        raise ValueError("A felülvizsgálati napértéknek pozitívnak kell lennie.")
+    return days
 
-def _fmt_date_full(value: Optional[Union[str, date]]) -> str:
-    """
-    Return full original date formatted as YYYY.MM.DD (e.g. 2025.04.20).
-    If value is None or empty -> return empty string.
-    """
-    if value is None:
-        return ""
-    if value == "":
-        return ""
-    try:
-        if isinstance(value, date):
-            return value.strftime("%Y.%m.%d")
-        if isinstance(value, str) and "T" in value:
-            return datetime.fromisoformat(value).date().strftime("%Y.%m.%d")
-        # accept YYYY-MM-DD
-        return datetime.strptime(value, "%Y.%m.%d").date().strftime("%Y.%m.%d")
-    except Exception:
-        try:
-            # try to parse more loosely
-            d = datetime.fromisoformat(str(value))
-            return d.date().strftime("%Y.%m.%d")
-        except Exception:
-            # fallback to string but avoid "None"
-            try:
-                return str(value)
-            except Exception:
-                return ""
 
-def _format_hatya(e: dict) -> str:
-    ht = e.get("hataly_tipus")
-    if ht is None:
-        ht = ""
-    try:
-        ht = ht.strip().lower()
-    except Exception:
-        ht = str(ht).lower() if ht is not None else ""
-    if ht == "fixed":
-        return _fmt_date(e.get("lejarat"), "%Y/%m")
-    if ht == "indefinite" or (not ht and e.get("hatarozatlan") ):
-        return "Határozatlan"
-    return "Változtatásig"
+def _review_texts(item):
+    entries = _extract_review_entries(item)
+    dates = "\n".join(dict.fromkeys(d.strftime("%Y.%m.%d") for d, _ in entries))
+    notes = [f"{d:%Y.%m.%d}" + (f" : {note}" if note else "") for d, note in entries]
+    raw = item.get("felulvizsgalatok") or []
+    if isinstance(raw, str):
+        raw = json.loads(raw) if raw.strip() else []
+    for entry in raw or []:
+        if entry.get("type") == "before_expiry":
+            expiry = parse_date(item.get("lejarat")) if validity_type(item) == "fixed" else None
+            if expiry is None:
+                text = f"{_review_days(entry.get('days'))} nappal a lejárat előtt"
+                if entry.get("note"):
+                    text += " : " + str(entry["note"])
+                notes.append(text)
+            continue
+        if not entry.get("date"):
+            text = entry.get("text") or entry.get("note") or entry.get("condition")
+            if text:
+                notes.append(str(text))
+    if not raw and not entries and item.get("felulvizsgalat_nap") not in (None, "", 0, "0"):
+        notes.append(f"{_review_days(item['felulvizsgalat_nap'])} nappal a lejárat előtt")
+    return dates, "FELÜLVIZSGÁLATOK:\n" + "\n".join(notes) if notes else ""
 
-def _none_to_empty(v: Any) -> Any:
-    """Return empty string only when v is None; otherwise return v unchanged."""
-    return "" if v is None else v
 
-def _render_str(v: Any) -> str:
-    """Render value as string for output, but treat None as empty string."""
-    if v is None:
-        return ""
-    # keep empty string as-is
-    if isinstance(v, str):
-        return v
-    try:
-        return str(v)
-    except Exception:
-        return ""
-
-def _extract_review_entries(e: dict) -> List[tuple]:
-    """
-    Shared extractor used by report_builder exporter.
-    """
-    entries: List[tuple] = []
-    raw = e.get("felulvizsgalatok")
-    if raw:
-        try:
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(parsed, list):
-                for it in parsed:
-                    if isinstance(it, dict):
-                        d = it.get("date")
-                        note = (it.get("note") or "").strip()
-                        if d:
-                            try:
-                                dd = datetime.fromisoformat(d).date()
-                                entries.append((dd, note))
-                            except Exception:
-                                try:
-                                    dd = datetime.strptime(str(d), "%Y.%m.%d").date()
-                                    entries.append((dd, note))
-                                except Exception:
-                                    continue
-        except Exception:
-            entries = []
-
-    if not entries:
-        fv_single = e.get("felulvizsgalat_date")
-        if fv_single:
-            try:
-                dd = datetime.fromisoformat(fv_single).date()
-                entries.append((dd, ""))
-            except Exception:
-                try:
-                    dd = datetime.strptime(str(fv_single), "%Y.%m.%d").date()
-                    entries.append((dd, ""))
-                except Exception:
-                    pass
-
-    if not entries:
-        try:
-            fv_nap = int(e.get("felulvizsgalat_nap") or 0)
-        except Exception:
-            fv_nap = 0
-        lejarat = e.get("lejarat")
-        if fv_nap > 0 and lejarat:
-            try:
-                ld = datetime.strptime(lejarat, "%Y.%m.%d").date()
-                comp = ld - timedelta(days=fv_nap)
-                entries.append((comp, f"{fv_nap} nappal a lejárat előtt (számított)"))
-            except Exception:
-                pass
-
-    if not entries:
-        try:
-            from utils import compute_review_date
-            fv = compute_review_date(e)
-            if fv:
-                entries.append((fv, ""))
-        except Exception:
-            pass
-
-    unique = {}
-    for dt, note in entries:
-        key = dt.isoformat()
-        if key not in unique:
-            unique[key] = (dt, note or "")
-    return [unique[k] for k in sorted(unique.keys())]
-
-def _format_review_dates_only(e: dict, date_format: str = "%Y.%m.%d") -> str:
-    entries = _extract_review_entries(e)
-    if not entries:
-        return ""
-    return "\n".join(dt.strftime(date_format) for dt, _ in entries)
-
-def _format_review_block(e: dict, date_format: str = "%Y.%m.%d", for_pdf: bool = False) -> str:
-    entries = _extract_review_entries(e)
-    if not entries:
-        return ""
-    if for_pdf:
-        lines = []
-        for dt, note in entries:
-            ds = dt.strftime(date_format)
-            if note:
-                lines.append(f"<strong>{ds}</strong>: {note}")
-            else:
-                lines.append(f"<strong>{ds}</strong>")
-        return "FELÜLVIZSGÁLATOK:<br/>" + "<br/>".join(lines)
-    else:
-        lines = []
-        for dt, note in entries:
-            ds = dt.strftime(date_format)
-            if note:
-                lines.append(f"{ds} : {note}")
-            else:
-                lines.append(f"{ds}")
-        return "FELÜLVIZSGÁLATOK:\n" + "\n".join(lines)
-
-def _prepare_row(e: dict, tp_map: Dict[Any,str], columns: List[str], include_waste=True) -> Dict[str,Any]:
-    """
-    Prepare row values. Important: keep non-None values unchanged where possible;
-    only replace None with empty string when rendering (_render_str).
-    Special handling:
-     - 'modosito_hat': if contains ';' then replace with newline for proper wrapping.
-     - 'lejarat'/'lejarat_display': always show the original full date (YYYY.MM.DD) if present.
-     - 'felulvizsgalat': return dates only (multiline).
-     - 'megjegyzes': append FELÜLVIZSGÁLATOK block (multiline). For PDF the caller will convert '\n' to '<br/>'.
-    """
+def _prepare_row(item, tp_map, columns, include_waste=True):
     row = {}
+    reviews = _review_texts(item) if any(c in columns for c in ("felulvizsgalat", "megjegyzes")) else ("", "")
     for key in columns:
+        value = item.get(key)
         if key == "telephely":
-            val = tp_map.get(e.get("telephely_id"))
-            row[key] = _none_to_empty(val)
+            value = tp_map.get(item.get("telephely_id"), "Ismeretlen")
         elif key == "kategoria":
-            row[key] = _none_to_empty(e.get("kategoria"))
-        elif key == "engedely_nev":
-            row[key] = _none_to_empty(e.get("engedely_nev"))
-        elif key == "kiado_hatosag":
-            row[key] = _none_to_empty(e.get("kiado_hatosag"))
+            value = value or "Ismeretlen"
         elif key == "hatarozatszam":
-            v = e.get("hatarozatszam")
-            if v is None:
-                row[key] = ""
-            else:
-                # preserve value but normalize newlines
-                row[key] = (v if isinstance(v, str) else str(v)).replace("\n", " ")
+            value = _render_str(value).replace("\n", " ")
         elif key == "modosito_hat":
-            v = e.get("modosito_hat")
-            if v is None:
-                row[key] = ""
-            else:
-                # If semicolon separated, convert semicolons to line breaks (user requested)
-                s = v if isinstance(v, str) else str(v)
-                # Normalize '; ' and ';' to newline
-                s = re.sub(r";\s*", "\n", s)
-                row[key] = s
-        elif key in ("lejarat","lejarat_display"):
-            # Per request: always show original full date in cells (YYYY.MM.DD) if available
-            row[key] = _fmt_date_full(e.get("lejarat"))
-        elif key == "megjegyzes":
-            mg = _none_to_empty(e.get("megjegyzes"))
-            # append review block (plain text)
-            review_block = _format_review_block(e, "%Y.%m.%d", for_pdf=False)
-            if review_block:
-                if mg:
-                    mg = mg + "\n\n" + review_block
-                else:
-                    mg = review_block
-            # include waste compact info if present
-            if (e.get("kategoria")=="Hulladékgazdálkodási engedély") and include_waste:
-                parts=[]
-                for k2 in ("hulladek_nv_elokez","hulladek_v_elokez","hulladek_nv_gyujt","hulladek_v_gyujt"):
-                    val = e.get(k2)
-                    if val is not None and val != "":
-                        parts.append(f"{KEY_TO_HEADER.get(k2,k2)}: {_render_str(val)}")
-                if parts:
-                    mg = (mg + "\n" if mg else "") + "[" + ", ".join(parts) + "]"
-            row[key] = mg
+            value = re.sub(r";\s*", "\n", _render_str(value))
+        elif key == "letrejott":
+            value = _fmt_date_full(value)
+        elif key == "lejarat":
+            kind = validity_type(item)
+            value = {"indefinite": "Határozatlan", "until_change": "Változtatásig"}.get(kind)
+            if value is None:
+                value = _fmt_date_full(item.get("lejarat"))
         elif key == "felulvizsgalat":
-            # dates only, multiline
-            row[key] = _format_review_dates_only(e, "%Y.%m.%d")
-        else:
-            row[key] = _none_to_empty(e.get(key))
+            value = reviews[0]
+        elif key == "megjegyzes":
+            value = _render_str(value)
+            if reviews[1]:
+                value = (value + "\n\n" if value else "") + reviews[1]
+            if item.get("kategoria") == "Hulladékgazdálkodási engedély" and include_waste:
+                parts = [f"{label}: {item[k]}" for k, label in ALL_COLUMNS
+                         if k.startswith("hulladek_") and item.get(k) not in (None, "")]
+                if parts:
+                    value = (value + "\n" if value else "") + "[" + ", ".join(parts) + "]"
+        row[key] = "" if value is None else value
     return row
 
-def _prune_empty_columns(items: List[Dict[str, Any]], columns: List[str], tp_map: Dict[Any,str], include_waste: bool) -> List[str]:
+
+@dataclass
+class PreparedGroup:
+    name: str
+    columns: list[str]
+    rows: list[list[Any]]
+
+    @property
+    def headers(self):
+        return [KEY_TO_HEADER[key] for key in self.columns]
+
+
+def prepare_report_groups(groups_or_items, telephelyek, columns, include_waste=True, *, prune_empty=True):
+    """Canonical data consumed by the preview and both exporters.
+
+    Legacy callers retain dynamic column pruning. The builder disables pruning
+    so explicitly selected empty columns remain visible in every group.
     """
-    Remove columns that are empty for ALL items in the group. Preserve some essential columns.
-    Only considers None/empty-string as empty.
-    """
-    if not items:
-        return [c for c in columns]
-    essential = {"telephely", "kategoria", "engedely_nev"}
+    groups = groups_or_items if isinstance(groups_or_items, dict) else {"Összes": groups_or_items or []}
+    tp_map = {t["id"]: t.get("nev") or "Ismeretlen" for t in telephelyek}
     result = []
-    for col in columns:
-        if col in essential:
-            result.append(col)
-            continue
-        has_value = False
-        for e in items:
-            v = _prepare_row(e, tp_map, [col], include_waste).get(col)
-            if v not in (None, ""):
-                has_value = True
-                break
-        if has_value:
-            result.append(col)
+    for name, items in groups.items():
+        requested = columns.get(name, columns.get("default", list(KEY_TO_HEADER))) if isinstance(columns, dict) else columns
+        if not requested:
+            if not prune_empty:
+                raise ValueError("Válasszon legalább egy oszlopot.")
+            requested = list(KEY_TO_HEADER)
+        keys = list(dict.fromkeys(ALIASES.get(key, key) for key in requested))
+        if any(key not in KEY_TO_HEADER for key in keys):
+            raise ValueError("Ismeretlen kimutatásoszlop.")
+        ordered = sorted(items, key=lambda item: (item.get("kategoria") or "").casefold())
+        rows = [_prepare_row(item, tp_map, keys, include_waste) for item in ordered]
+        if prune_empty and rows:
+            essential = {"telephely", "kategoria", "engedely_nev"}
+            kept = [key for key in keys if key in essential or any(row[key] not in (None, "") for row in rows)]
+            # A group containing only empty selected columns must remain exportable.
+            keys = kept or keys
+        result.append(PreparedGroup(str(name), keys, [[row[key] for key in keys] for row in rows]))
     return result
 
-# (a fájl többi része változatlan, a PDF útvonalon a _format_review_block(..., for_pdf=True) használható a megjegyzés HTML előállításához)
-def build_header_context(
-    *,
-    group_by: Optional[str]=None,
-    group_name: Optional[str]=None,
-    telephely_map: Optional[Dict]=None,
-    date_filter: Optional[Dict]=None
-) -> str:
-    parts=[]
-    if group_by and group_name and group_name!="Összes":
-        if group_by=="telephely":
-            resolved = str(group_name)
-            if telephely_map:
-                if group_name in telephely_map:
-                    resolved = telephely_map[group_name]
-                else:
-                    try:
-                        gi = int(group_name)
-                        if gi in telephely_map:
-                            resolved = telephely_map[gi]
-                    except Exception:
-                        for k,v in telephely_map.items():
-                            if str(v) == str(group_name):
-                                resolved = v
-                                break
-            parts.append(f"{resolved}")
-        elif group_by=="kategoria":
-            parts.append(f"{group_name}")
-        elif group_by in ("lejarat_month","lejarat","lejarat_year"):
-            try:
-                m = re.match(r"^(\d{4})[-/](\d{2})", str(group_name))
-                if m:
-                    y, mm = m.group(1), m.group(2)
-                    parts.append(f"{y}/{mm}")
-                else:
-                    parts.append(f"{group_name}")
-            except Exception:
-                parts.append(f"{group_name}")
 
-    if date_filter and date_filter.get("enabled"):
-        fr = date_filter.get("from")
-        to = date_filter.get("to")
-        fr_s = fr.strftime("%Y.%m.%d") if fr else "–"
-        to_s = to.strftime("%Y.%m.%d") if to else "–"
-        parts.append(f"Dátum: {fr_s}—{to_s}")
+def _register_fonts():
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    candidates = [
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/freefont/FreeSans.ttf", "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
+        ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/arialbd.ttf"),
+        ("/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+        (str(Path(__file__).parent / "fonts/DejaVuSans.ttf"), str(Path(__file__).parent / "fonts/DejaVuSans-Bold.ttf")),
+    ]
+    for regular, bold in candidates:
+        if Path(regular).is_file() and Path(bold).is_file():
+            pdfmetrics.registerFont(TTFont("App-Regular", regular))
+            pdfmetrics.registerFont(TTFont("App-Bold", bold))
+            return "App-Regular", "App-Bold"
+    raise RuntimeError("A magyar PDF-exporthoz Unicode betűkészlet szükséges (DejaVu Sans, Liberation Sans vagy Arial).")
 
-    if not parts: return ""
-    return "("+"; ".join(parts)+")"
 
-# ----------------- PDF export -----------------
-def _pdf_footer(canvas, doc):
-    canvas.saveState()
-    try:
-        canvas.setFont(REGULAR_FONT,9)
-    except Exception:
-        canvas.setFont("Helvetica",9)
-    canvas.drawRightString(landscape(A4)[0]-1*cm,1*cm,f"{canvas.getPageNumber()}. oldal")
-    canvas.restoreState()
+def _pdf_text(value):
+    return escape(_render_str(value)).replace("\n", "<br/>")
 
-def export_report_pdf(
-    path: str,
-    groups_or_items: Union[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]],
-    telephelyek: List[dict],
-    columns: Union[List[str], Dict[str, List[str]]],
-    title: Optional[str] = None,
-    subtitle: Optional[str] = None,
-    logo_path: Optional[str] = None,
-    include_waste: bool = True,
-) -> None:
-    """
-    Unified PDF exporter.
-    - groups_or_items: either dict group_name->items or list of items (treated as single group "Összes")
-    - columns: either global list of keys or dict mapping group_name->list(keys)
-    - For each group the exporter prunes columns that are empty for that group's items (dynamic headers).
-    Only None values are converted to empty strings; other values are preserved and stringified when rendered.
-    Note: subtitle is intentionally ignored (no alcím).
-    """
-    if not PDF_ENABLED:
-        print(f"PDF export disabled, would write to {path}")
-        return
 
-    tp_map = {t["id"]: t.get("nev","Ismeretlen") for t in telephelyek}
-    groups = groups_or_items if isinstance(groups_or_items, dict) else {"Összes": groups_or_items or []}
+def export_report_pdf(path, groups_or_items, telephelyek, columns, title=None,
+                      subtitle=None, logo_path=None, include_waste=True, *, prune_empty=True):
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, PageBreak, Image, Spacer, Paragraph
 
-    doc = SimpleDocTemplate(path, pagesize=landscape(A4),
-                            leftMargin=0.6*cm, rightMargin=0.6*cm, topMargin=0.8*cm, bottomMargin=1.6*cm)
-    styles = {
-        "title": ParagraphStyle("title", fontName=BOLD_FONT, fontSize=16, spaceAfter=6, alignment=1),
-        "h": ParagraphStyle("h", fontName=BOLD_FONT, fontSize=9, alignment=1),
-        "c": ParagraphStyle("c", fontName=REGULAR_FONT, fontSize=9, leading=11),
-        "info": ParagraphStyle("info", fontName=REGULAR_FONT, fontSize=10, leading=11, alignment=1)
-    }
+    groups = prepare_report_groups(groups_or_items, telephelyek, columns, include_waste, prune_empty=prune_empty)
+    if not groups:
+        raise ValueError("Nincs exportálható csoport.")
+    regular, bold = _register_fonts()
+    doc = SimpleDocTemplate(str(path), pagesize=landscape(A4),
+                            leftMargin=.6*cm, rightMargin=.6*cm, topMargin=.8*cm, bottomMargin=1.6*cm)
+    title_style = ParagraphStyle("title", fontName=bold, fontSize=16, leading=19, alignment=1, spaceAfter=6)
+    header_style = ParagraphStyle("header", fontName=bold, fontSize=9, leading=11, alignment=1)
+    cell_style = ParagraphStyle("cell", fontName=regular, fontSize=9, leading=11)
     elements = []
-
-    # logo only if provided and title exists (no subtitle rendering)
-    if logo_path and os.path.exists(logo_path) and (title):
-        try:
-            img = Image(logo_path, width=6*cm, height=2*cm, kind='proportional')
-            img.hAlign = 'CENTER'
-            elements.append(img)
-            elements.append(Spacer(1,0.2*cm))
-        except Exception:
-            logger.debug("Logo add failed", exc_info=True)
-
+    if logo_path:
+        image = Image(str(logo_path), width=6*cm, height=2*cm, kind="proportional")
+        image.hAlign = "CENTER"
+        elements.extend([image, Spacer(1, .2*cm)])
     if title:
-        elements.append(Paragraph(_render_str(title), styles["title"]))
-    # subtitle intentionally not appended
-    if title:
-        elements.append(Spacer(1,0.2*cm))
-
-    # iterate groups
-    grp_items = list(groups.items())
-    for idx, (gname, items) in enumerate(grp_items):
-        items_sorted = sorted(items, key=lambda e: (e.get("kategoria") or "").lower())
-        # resolve columns for this group
-        if isinstance(columns, dict):
-            group_cols = columns.get(gname, columns.get("default", list(KEY_TO_HEADER.keys())))
-        else:
-            group_cols = columns or list(KEY_TO_HEADER.keys())
-        # prune empty columns for group (dynamic headers)
-        effective_cols = _prune_empty_columns(items_sorted, group_cols, tp_map, include_waste)
-
-        # build table header and rows
-        headers = [Paragraph(KEY_TO_HEADER.get(k, k), styles["h"]) for k in effective_cols]
-        table_data = [headers]
-        # prepare text strings and compute max length per column for adaptive width
-        col_texts = {k: [KEY_TO_HEADER.get(k, k)] for k in effective_cols}
-        for e in items_sorted:
-            r = _prepare_row(e, tp_map, effective_cols, include_waste)
-            row_cells = []
-            for k in effective_cols:
-                val = r.get(k, "")
-                cell_text = _render_str(val)
-                col_texts[k].append(cell_text)
-                row_cells.append(Paragraph(cell_text.replace("\n","<br/>"), styles["c"]))
-            table_data.append(row_cells)
-
-        page_w = landscape(A4)[0] - doc.leftMargin - doc.rightMargin
-
-        # compute base weights and scale them by content length so wider content gets more space
-        def _col_base_weight(k):
-            if k in ("engedely_nev","megjegyzes"):
-                return 3.0
-            if k in ("telephely","kategoria"):
-                return 1.0
-            if k in ("hatarozatszam","kiado_hatosag"):
-                return 1.2
-            if k in ("lejarat","lejarat_display"):
-                # dates need less width usually
-                return 0.9
-            return 0.9
-
-        # compute a length factor per column (based on max number of characters)
-        weights = []
-        for k in effective_cols:
-            base = _col_base_weight(k)
-            texts = col_texts.get(k, [""])
-            max_len = max((len(t) for t in texts), default=0)
-            # length factor: 1 + log(1 + max_len) / 3  -> gentle growth for long content
-            length_factor = 1.0 + (math.log1p(max_len) / 3.0) if max_len > 0 else 1.0
-            weights.append(base * length_factor)
-
-        total_w = sum(weights) if weights else 1.0
-        col_widths = [page_w * (w / total_w) for w in weights]
-
-        t = Table(table_data, colWidths=col_widths, repeatRows=1)
-        t.setStyle(TableStyle([
-            ('BACKGROUND',(0,0),(-1,0),HexColor("#70D925")),
-            ('TEXTCOLOR',(0,0),(-1,0),colors.black),
-            ('ALIGN',(0,0),(-1,-1),'LEFT'),
-            ('VALIGN',(0,0),(-1,-1),'TOP'),
-            ('GRID',(0,0),(-1,-1),0.4,colors.grey),
-            ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,HexColor("#F1FBE9")])
-        ]))
-
-        # group header (title line per group)
-        grp_context = build_header_context(group_by=None, group_name=gname, telephely_map=tp_map, date_filter=None)
-        if grp_context:
-            grp_title = Paragraph(f"<b>{_render_str(gname)}</b> {grp_context}", styles["info"])
-            elements.append(grp_title)
-            elements.append(Spacer(1,0.15*cm))
-        else:
-            elements.append(Paragraph(f"<b>{_render_str(gname)}</b>", styles["info"]))
-            elements.append(Spacer(1,0.15*cm))
-
-        elements.append(t)
-
-        if idx < len(grp_items) - 1:
+        elements.extend([Paragraph(_pdf_text(title), title_style), Spacer(1, .2*cm)])
+    for index, group in enumerate(groups):
+        if index:
             elements.append(PageBreak())
+        elements.extend([Paragraph(_pdf_text(group.name), header_style), Spacer(1, .15*cm)])
+        data = [[Paragraph(_pdf_text(label), header_style) for label in group.headers]]
+        data.extend([[Paragraph(_pdf_text(value), cell_style) for value in row] for row in group.rows])
+        weights = []
+        for col, key in enumerate(group.columns):
+            longest = max([len(group.headers[col])] + [len(_render_str(row[col])) for row in group.rows])
+            base = 3 if key in ("engedely_nev", "megjegyzes") else 1
+            weights.append(base * (1 + math.log1p(longest) / 3))
+        widths = [doc.width * weight / sum(weights) for weight in weights]
+        table = Table(data, colWidths=widths, repeatRows=1, splitInRow=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#70D925")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("GRID", (0, 0), (-1, -1), .4, colors.grey),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F1FBE9")]),
+        ]))
+        elements.append(table)
 
-    doc.build(elements, onFirstPage=_pdf_footer, onLaterPages=_pdf_footer)
+    def footer(canvas, document):
+        canvas.saveState()
+        canvas.setFont(regular, 9)
+        canvas.drawRightString(landscape(A4)[0] - cm, cm, f"{canvas.getPageNumber()}. oldal")
+        canvas.restoreState()
 
-# ----------------- Excel export -----------------
-def export_report_excel(
-    path: str,
-    groups_or_items: Union[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]],
-    telephelyek: List[dict],
-    columns: Union[List[str], Dict[str, List[str]]],
-    title: Optional[str] = None,
-    subtitle: Optional[str] = None,
-    include_waste: bool = True,
-) -> None:
-    """
-    Excel exporter:
-    - If groups_or_items is dict -> each group becomes a sheet (or single sheet per export when single group)
-    - columns may be dict mapping group->list or a global list
-    - Column pruning same as PDF: hide columns that are empty for a group's data
-    Only None values are turned into empty strings in the sheet; other values preserved/stringified.
-    Note: subtitle is ignored (no alcím).
-    """
-    if not EXCEL_ENABLED:
-        print(f"Excel export disabled, would write to {path}")
-        return
+    doc.build(elements, onFirstPage=footer, onLaterPages=footer)
 
-    tp_map = {t["id"]: t.get("nev","Ismeretlen") for t in telephelyek}
-    groups = groups_or_items if isinstance(groups_or_items, dict) else {"Összes": groups_or_items or []}
 
-    # prepare writer
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        for gname, items in groups.items():
-            if not items:
-                # create empty sheet with requested headers
-                cols = (columns if isinstance(columns, list) else (columns.get(gname, list(KEY_TO_HEADER.keys())) if isinstance(columns, dict) else list(KEY_TO_HEADER.keys())))
-                df = pd.DataFrame(columns=[KEY_TO_HEADER.get(k,k) for k in cols])
-                sheet_name = (_render_str(gname)[:31]) if gname else "Üres"
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-                continue
+def _unique_name(base, used, limit):
+    base = base[:limit] or "Csoport"
+    candidate = base
+    number = 2
+    while candidate.casefold() in used:
+        suffix = f"_{number}"
+        candidate = base[:limit-len(suffix)] + suffix
+        number += 1
+    used.add(candidate.casefold())
+    return candidate
 
-            # pick columns for this group
-            if isinstance(columns, dict):
-                group_cols = columns.get(gname, columns.get("default", list(KEY_TO_HEADER.keys())))
-            else:
-                group_cols = columns or list(KEY_TO_HEADER.keys())
 
-            effective_cols = _prune_empty_columns(items, group_cols, tp_map, include_waste)
+def export_report_excel(path, groups_or_items, telephelyek, columns, title=None,
+                        subtitle=None, include_waste=True, *, prune_empty=True):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
 
-            rows = []
-            for e in items:
-                r = _prepare_row(e, tp_map, effective_cols, include_waste)
-                # ensure only None -> "", others preserved then stringified by pandas if needed
-                rows.append([_none_to_empty(r.get(k, "")) for k in effective_cols])
+    groups = prepare_report_groups(groups_or_items, telephelyek, columns, include_waste, prune_empty=prune_empty)
+    if not groups:
+        raise ValueError("Nincs exportálható csoport.")
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    names = set()
+    for group in groups:
+        base = re.sub(r"[\\/*?:\[\]\x00-\x1f]", "_", group.name).strip("'") or "Csoport"
+        name = _unique_name(base, names, 31)
+        sheet = workbook.create_sheet(name)
+        thin = Side(border_style="thin", color="888888")
+        for row_index, row in enumerate([group.headers] + group.rows, 1):
+            for col_index, value in enumerate(row, 1):
+                if isinstance(value, str) and len(value) > 32767:
+                    raise ValueError("Az Excel-cellák legfeljebb 32767 karaktert tartalmazhatnak.")
+                cell = sheet.cell(row=row_index, column=col_index, value=value)
+                if isinstance(value, str):
+                    # Permit data is text, never an executable spreadsheet formula.
+                    cell.data_type = "s"
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                if row_index == 1:
+                    cell.font = Font(color="FFFFFF", bold=True)
+                    cell.fill = PatternFill("solid", fgColor="000000")
+                    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for col_index in range(len(group.columns)):
+            values = [group.headers[col_index]] + [row[col_index] for row in group.rows]
+            width = max(len(line) for value in values for line in (_render_str(value).splitlines() or [""]))
+            sheet.column_dimensions[get_column_letter(col_index+1)].width = min(60, max(12, width+2))
+    workbook.save(str(path))
+    workbook.close()
 
-            df = pd.DataFrame(rows, columns=[KEY_TO_HEADER.get(k,k) for k in effective_cols])
-            sheet_name = (_render_str(gname)[:31]) if gname else "Sheet1"
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
 
-            # styling: header + enable wrap_text for all data cells (so '\n' from modosito_hat shows)
-            ws = writer.sheets[sheet_name]
-            thin = Side(border_style="thin", color="888888")
-            # header row style
-            for col_idx, _ in enumerate(effective_cols, start=1):
-                cell = ws.cell(row=1, column=col_idx)
-                cell.font = Font(color="FFFFFF", bold=True)
-                cell.fill = PatternFill(start_color="000000", end_color="000000", fill_type="solid")
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
-            # data cells: enable wrap_text so semicolon->newline conversion displays nicely
-            for row_idx in range(2, 2 + len(rows)):
-                for col_idx in range(1, len(effective_cols) + 1):
-                    cell = ws.cell(row=row_idx, column=col_idx)
-                    # preserve existing value, but ensure wrap_text True
-                    cell.alignment = Alignment(wrap_text=True, vertical="top")
-
-            # autosize
-            for i, col in enumerate(ws.columns, start=1):
-                max_len = 0
-                for cell in col:
-                    v = cell.value
-                    # treat None as empty string for measuring
-                    if v is None:
-                        v = ""
-                    else:
-                        v = str(v)
-                    # consider multi-line; take the longest line
-                    longest_line = max((len(line) for line in v.splitlines()), default=0)
-                    max_len = max(max_len, longest_line)
-                ws.column_dimensions[get_column_letter(i)].width = min(60, max(12, max_len + 2))
-
-# ----------------- Convenience wrapper -----------------
-def export_report(
-    path: Union[str, Path],
-    items_or_groups: Union[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]],
-    telephelyek: List[dict],
-    columns: Union[List[str], Dict[str, List[str]]],
-    fmt: str = "PDF",
-    title: Optional[str] = None,
-    group_by: Optional[str] = None,
-    group_name: Optional[str] = None,
-    date_filter: Optional[Dict] = None,
-    logo_path: Optional[str] = None,
-    include_waste: bool = True,
-    per_group: bool = False,
-):
-    """
-    Unified entry point used by the UI.
-    - path: file path (if per_group True and fmt is PDF/XLSX, path is treated as directory)
-    - items_or_groups: either dict or flat list
-    - columns: list or dict
-    - per_group: if True and items_or_groups is dict -> create separate files per group inside `path` (treated as dir)
-    Behavior change requested: ONLY None values are replaced with empty strings ("") in outputs.
-    Subtitle (alcím) is ignored and not shown.
-    """
-    if isinstance(path, Path):
-        path = path.as_posix()
-
-    # flatten or preserve groups
+def export_report(path, items_or_groups, telephelyek, columns, fmt="PDF", title=None,
+                  group_by=None, group_name=None, date_filter=None, logo_path=None,
+                  include_waste=True, per_group=False, *, prune_empty=True):
+    """Export one file or one file per group; legacy public arguments remain valid."""
+    fmt = fmt.upper()
+    if fmt not in ("PDF", "XLSX", "EXCEL", "EXCEL (XLSX)"):
+        raise ValueError("Nem támogatott exportformátum.")
     groups = items_or_groups if isinstance(items_or_groups, dict) else {"Összes": items_or_groups or []}
-
-    if fmt.upper().startswith("PDF"):
-        if per_group and isinstance(groups, dict):
-            # require path to be a directory
-            out_dir = path
-            os.makedirs(out_dir, exist_ok=True)
-            for gname, items in groups.items():
-                safe = re.sub(r"[^A-Za-z0-9_\-\.]", "_", str(gname)).strip("_") or "group"
-                out_path = os.path.join(out_dir, f"{safe}.pdf")
-                # columns may be dict or list: pass through
-                try:
-                    export_report_pdf(out_path, {gname: items}, telephelyek, columns, title=_render_str(title), subtitle=None, logo_path=logo_path, include_waste=include_waste)
-                except Exception as exc:
-                    logger.exception("PDF export per-group failed for %s: %s", gname, exc)
-                    raise
-        else:
-            # single file containing all groups (separate pages)
-            export_report_pdf(path, groups, telephelyek, columns, title=_render_str(title), subtitle=None, logo_path=logo_path, include_waste=include_waste)
-    else:
-        # Excel
-        if per_group and isinstance(groups, dict):
-            out_dir = path
-            os.makedirs(out_dir, exist_ok=True)
-            for gname, items in groups.items():
-                safe = re.sub(r"[^A-Za-z0-9_\-\.]", "_", str(gname)).strip("_") or "group"
-                out_path = os.path.join(out_dir, f"{safe}.xlsx")
-                try:
-                    export_report_excel(out_path, {gname: items}, telephelyek, columns, title=_render_str(title), subtitle=None, include_waste=include_waste)
-                except Exception as exc:
-                    logger.exception("Excel export per-group failed for %s: %s", gname, exc)
-                    raise
-        else:
-            # single workbook with a sheet per group
-            export_report_excel(path, groups, telephelyek, columns, title=_render_str(title), subtitle=None, include_waste=include_waste)
+    if not groups:
+        raise ValueError("Nincs exportálható csoport.")
+    exporter = export_report_pdf if fmt == "PDF" else export_report_excel
+    kwargs = {"title": title, "include_waste": include_waste, "prune_empty": prune_empty}
+    if fmt == "PDF":
+        kwargs["logo_path"] = logo_path
+    if not per_group:
+        exporter(path, groups, telephelyek, columns, **kwargs)
+        return
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    suffix = ".pdf" if fmt == "PDF" else ".xlsx"
+    used = {p.stem.casefold() for p in directory.iterdir() if p.suffix.lower() == suffix}
+    for name, items in groups.items():
+        base = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name)).strip(" .") or "Csoport"
+        # Prefixing avoids Windows reserved device names (CON, AUX, COM1, ...).
+        base = "kimutatas_" + base
+        filename = _unique_name(base, used, 120) + suffix
+        exporter(directory / filename, {name: items}, telephelyek, columns, **kwargs)

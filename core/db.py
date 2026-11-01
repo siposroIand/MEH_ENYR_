@@ -12,6 +12,7 @@ import os
 import logging
 from random import uniform
 import json
+from uuid import uuid4
 
 from utils.fs_utils import create_lockfile, release_lockfile
 
@@ -19,6 +20,27 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 8
 RETRY_INTERVAL = 0.15  # base interval in seconds
+
+PERMIT_COLUMNS = (
+    "telephely_id", "engedely_nev", "kategoria", "kiado_hatosag",
+    "hatarozatszam", "modosito_hat", "letrejott", "hatarozatlan",
+    "lejarat", "hataly_tipus", "felulvizsgalat_nap", "felulvizsgalat_date",
+    "felulvizsgalatok", "megjegyzes", "hulladek_nv_elokez",
+    "hulladek_v_elokez", "hulladek_nv_gyujt", "hulladek_v_gyujt",
+)
+
+
+class ConflictError(sqlite3.IntegrityError):
+    """The editor's snapshot no longer matches the stored record."""
+
+
+def _require_updated(cursor) -> None:
+    if cursor.rowcount != 1:
+        raise ConflictError(
+            "A tételt időközben más módosította vagy törölte. "
+            "A beírt adatok megmaradtak, de nem írtuk felül a másik felhasználó munkáját. "
+            "Másolja ki a szükséges módosításokat, majd zárja be és nyissa meg újra az adatlapot."
+        )
 
 
 def retry_db(func):
@@ -163,6 +185,11 @@ class Database:
             ("felulvizsgalatok", "TEXT")
         ]
         with self.get_connection() as conn:
+            # Concurrency tokens are required, so migration failures must abort startup.
+            for table in ("telephelyek", "engedelyek"):
+                columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if "revision" not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN revision TEXT NOT NULL DEFAULT ''")
             cur = conn.cursor()
             added_validity_column = False
             # telephelyek oszlopok
@@ -294,14 +321,88 @@ class Database:
     @retry_db
     def get_all_data(self) -> Dict[str, List[Dict[str, Any]]]:
         with self.get_connection() as conn:
-            tps = [dict(row) for row in conn.execute("SELECT id, nev, ktj, cim FROM telephelyek ORDER BY nev").fetchall()]
+            conn.execute("BEGIN")
+            tps = [dict(row) for row in conn.execute("SELECT * FROM telephelyek ORDER BY nev").fetchall()]
             engs = [dict(row) for row in conn.execute("SELECT * FROM engedelyek WHERE (deleted IS NULL OR deleted=0)").fetchall()]
             return {"telephelyek": tps, "engedelyek": engs}
 
     @retry_db
     def get_telephelyek(self) -> List[Dict[str, Any]]:
         with self.get_connection() as conn:
-            return [dict(r) for r in conn.execute("SELECT id, nev, ktj, cim FROM telephelyek").fetchall()]
+            return [dict(r) for r in conn.execute("SELECT * FROM telephelyek").fetchall()]
+
+    @retry_db
+    def save_permit(self, data: dict, entity_id: str, updating: bool = False) -> None:
+        if not data.get("telephely_id") or not data.get("hatarozatszam"):
+            raise ValueError("A telephely és a határozatszám kötelező.")
+        values = dict(data)
+        values["felulvizsgalatok"] = json.dumps(data.get("felulvizsgalatok", []), ensure_ascii=False)
+        columns = (*PERMIT_COLUMNS, "last_modified", "revision")
+        parameters = [values.get(column) for column in PERMIT_COLUMNS]
+        parameters.extend((datetime.utcnow().isoformat(), str(uuid4())))
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if not conn.execute("SELECT 1 FROM telephelyek WHERE id=?", (data["telephely_id"],)).fetchone():
+                raise sqlite3.IntegrityError("A kiválasztott telephely már nem létezik.")
+            if updating:
+                assignments = ", ".join(f"{column}=?" for column in columns)
+                cursor = conn.execute(
+                    f"UPDATE engedelyek SET {assignments} "
+                    "WHERE id=? AND revision=? AND COALESCE(deleted, 0)=0",
+                    (*parameters, entity_id, data.get("revision", "")),
+                )
+                _require_updated(cursor)
+            else:
+                names = ", ".join(("id", *columns))
+                placeholders = ", ".join("?" for _ in range(len(columns) + 1))
+                conn.execute(f"INSERT INTO engedelyek ({names}) VALUES ({placeholders})",
+                             (entity_id, *parameters))
+
+    @retry_db
+    def change_permits(self, records: list[dict], field: str, value: int) -> None:
+        if field not in ("archivalt", "deleted") or type(value) is not int or value not in (0, 1):
+            raise ValueError("Érvénytelen állapotmódosítás.")
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for record in records:
+                cursor = conn.execute(
+                    f"UPDATE engedelyek SET {field}=?, last_modified=?, revision=? "
+                    "WHERE id=? AND revision=? AND COALESCE(deleted, 0)=0",
+                    (value, datetime.utcnow().isoformat(), str(uuid4()),
+                     record["id"], record.get("revision", "")),
+                )
+                _require_updated(cursor)
+
+    @retry_db
+    def save_telephely(self, data: dict, entity_id: str, updating: bool = False) -> None:
+        if not isinstance(data.get("nev"), str) or not data["nev"].strip():
+            raise ValueError("A telephely neve kötelező.")
+        values = (data["nev"], data.get("ktj"), data.get("cim"), str(uuid4()))
+        with self.get_connection() as conn:
+            if updating:
+                cursor = conn.execute(
+                    "UPDATE telephelyek SET nev=?, ktj=?, cim=?, revision=? WHERE id=? AND revision=?",
+                    (*values, entity_id, data.get("revision", "")),
+                )
+                _require_updated(cursor)
+            else:
+                conn.execute("INSERT INTO telephelyek (nev, ktj, cim, revision, id) VALUES (?,?,?,?,?)",
+                             (*values, entity_id))
+
+    @retry_db
+    def delete_telephely(self, entity_id: str, revision: str) -> None:
+        with self.get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM engedelyek WHERE telephely_id=? AND COALESCE(deleted, 0)=0 LIMIT 1",
+                (entity_id,),
+            ).fetchone():
+                raise sqlite3.IntegrityError(
+                    "A telephelyhez engedélyek tartoznak; előbb törölje vagy helyezze át azokat."
+                )
+            _require_updated(conn.execute(
+                "DELETE FROM telephelyek WHERE id=? AND revision=?", (entity_id, revision),
+            ))
 
     @retry_db
     def get_changes(self, since: Optional[str]) -> List[Dict[str, Any]]:
@@ -378,8 +479,5 @@ class Database:
 
     # egyszerű esemény log
     def log_event(self, note: Optional[str] = None) -> None:
-        try:
-            with self.get_connection() as conn:
-                conn.execute("INSERT INTO db_events (ts, note) VALUES (?, ?)", (int(time.time()), note or ""))
-        except Exception:
-            pass
+        with self.get_connection() as conn:
+            conn.execute("INSERT INTO db_events (ts, note) VALUES (?, ?)", (int(time.time()), note or ""))

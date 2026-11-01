@@ -16,6 +16,11 @@ A `config/app_config.py` fájl `NETWORK_ROOT` beállításában adja meg az
 adatkönyvtárat. Az alkalmazás itt tárolja az adatbázist, a csatolmányokat és a
 biztonsági mentéseket. A könyvtárhoz írási jogosultság szükséges.
 
+Egy gépes használatkor a SQLite-adatbázis helyi lemezen legyen. A könyvtár a
+`MEH_NETWORK_ROOT` környezeti változóval is megadható. Több számítógéphez az
+alábbi **Központi, többfelhasználós üzem** beállításait használja; ilyenkor ez
+a könyvtár a közösen elérhető csatolmányokat tartalmazza, nem az élő adatbázist.
+
 ### Helyi OCR
 
 A képekhez és szkennelt PDF-ekhez külön **Tesseract OCR** telepítés szükséges,
@@ -41,7 +46,12 @@ Tesseract. **A dokumentumok nem kerülnek külső OCR-szolgáltatóhoz.**
 ## Adatfelvitel és csatolmányok
 
 Az engedély adatlapján, az **Általános** fülön található a **Fájl tallózása…**
-gomb. PDF, PNG, JPEG, TIFF (többoldalas is), BMP és WebP hozzáadásakor
+gomb. A **Módosító határozatok** az alapadatok alatt, ugyanezen a fülön
+hozzáadhatók, szerkeszthetők, törölhetők és rendezhetők. A csatolmánykezelő
+az adatmezők alatt kapott helyet; a fájllista alapból összecsukott,
+a **Fájlok (darabszám)** gombbal nyitható ki.
+
+PDF, PNG, JPEG, TIFF (többoldalas is), BMP és WebP hozzáadásakor
 automatikusan elindul a háttérben a szövegfelismerés:
 
 - A `Tárgy:` utáni szöveg a tárgymezőbe kerül; több sor esetén a következő
@@ -76,6 +86,66 @@ menthetők. Ha az adatbázis mentése sikerül, de a fájlművelet nem, külön
 figyelmeztetés és újrapróbálási lehetőség jelenik meg. Megszakított újrapróbálás
 után a jelzett ideiglenes könyvtár fájljait kézzel kell rendezni.
 
+### Hatóságonkénti OCR-sablonok
+
+A csatolmánykezelő OCR-sablonválasztójában az automatikus felismerés mellett
+saját hatósági dokumentumsablon választható. A **Kiadó hatóság** mezőhöz
+illeszkedő profilok előre kerülnek a listában; új sablonhoz ez a hatóság
+alapértelmezett. A profilok létrehozhatók, szerkeszthetők, másolhatók és
+törölhetők az alkalmazásban.
+
+Az **Új sablon…** szerkesztőben nyisson meg mintadokumentumot, válasszon
+oldalt és mezőt (**Tárgy** vagy **Hatály/lejárat**), majd egérhúzással
+jelölje ki a felismerési területet. Az előnézet nagyítható, PDF és
+többoldalas kép is használható. A koordináták az oldal méretéhez
+viszonyítva, az oldalszámmal együtt mentődnek, így eltérő felbontású, de
+azonos elrendezésű szkennelt dokumentumokkal is használhatók.
+
+A sablon a kijelölt területeket helyi OCR-rel olvassa, nem az egész oldal
+szövegéből próbálja kitalálni a mezők helyét. Eltérő oldaltördeléshez vagy
+áthelyezett mezőkhöz másik sablon vagy új kijelölés szükséges. Hiányzó,
+ütköző vagy bizonytalan mezők nem töltődnek automatikusan. A kiválasztott
+sablon egy feldolgozási menet minden fájljára vonatkozik; különböző
+hatósági elrendezéseket külön menetben dolgozzon fel.
+
+Már csatolt fájlra is alkalmazható másik sablon: nyissa ki a fájllistát,
+jelölje ki a dokumentumot, válasszon sablont, és kattintson az
+**Újrafelismerés** gombra. Ez nem készít új csatolmányt. A feldolgozás
+közben kézzel módosított mezők továbbra is védettek.
+
+A sablonok a Qt `AppLocalDataLocation/ocr_templates` könyvtárában,
+felhasználónként helyileg tárolódnak JSON-fájlokként. A mentett profil nem
+tartalmazza a mintadokumentumot vagy annak felismert szövegét.
+**Mentés előtt minden OCR-eredményt ellenőrizzen.**
+
+## Kimutatáskészítő
+
+A Kimutatáskészítőben a telephely- és engedélytípus-szűrés mellett kiadó
+hatóságra, szövegre, hatályállapotra és dátumtartományra is szűrhet.
+Az archivált tételek bevonása külön választható. Az üres kijelölés nem
+jelenti automatikusan az összes tételt.
+
+Az oszlopok kiválaszthatók és húzással vagy a sorrendező gombokkal
+átrendezhetők. Az előnézet ugyanazt a szűrést, rendezést és mezőformázást
+használja, mint az Excel/PDF-export. Az előnézet legfeljebb nyolc sort,
+illetve csoportot mutat; az összefoglaló jelzi a teljes export mennyiségét.
+Az export nem csak az előnézetben látható első sorokat tartalmazza.
+A megnyitott kimutatás az adatokról nyitáskor készített pillanatképet
+használja, így egy másik felhasználó közben végzett mentése nem változtatja
+meg észrevétlenül az előnézethez képest az exportot. Új adatokhoz zárja be
+a kimutatást, frissítse a főlistát, majd nyissa meg újra.
+
+A beállítások névvel sablonként menthetők, később visszatölthetők és
+törölhetők; meglévő sablon felülírása megerősítést kér. A kimutatássablonok
+felhasználónként helyileg, a Qt `GenericDataLocation` könyvtárának
+alkalmazásnév szerinti almappájában, `report_templates.sqlite3` fájlban
+tárolódnak. Nem közös adatbázis-adatként szinkronizálódnak a gépek között.
+
+PDF-exporthoz Unicode-képes betűkészlet szükséges a magyar ékezetekhez:
+DejaVu, Liberation, FreeSans vagy Arial. Ha egyik sem telepített,
+az alkalmazás hibaüzenetet ad; telepítsen egyet, majd ismételje meg az
+exportot. A csoportonként külön készülő fájlok nevei nem ütköznek egymással.
+
 ## Adatbiztonság
 
 Az adatbázis-műveletek hiba esetén visszagörgetik a tranzakciót. A biztonsági
@@ -85,9 +155,100 @@ mentést, és őrizze meg a csatolmánykönyvtár másolatát is: az adatbázism
 önmagában nem tartalmazza a csatolmányokat.
 
 A meglévő SQLite WAL-üzemmód **nem alkalmas több számítógép egyidejű,
-hálózati fájlmegosztáson keresztüli adatbázis-hozzáférésére**. Ilyen üzemben
-központi adatbázis-szolgáltatásra vagy külön tárolási átalakításra van szükség;
-ezt az OCR-fejlesztés nem változtatja meg.
+hálózati fájlmegosztáson keresztüli adatbázis-hozzáférésére**.
+
+## Központi, többfelhasználós üzem
+
+2–3 felhasználó külön számítógépről a központi szolgáltatáson keresztül
+dolgozhat. Az egyik, folyamatosan bekapcsolt gép futtatja a szolgáltatást;
+**csak ez a gép nyitja meg a saját helyi lemezén lévő SQLite-adatbázist**.
+A csatolmányok maradhatnak a közös hálózati mappában. A kliensek ugyanazt a
+szolgáltatást és csatolmánykönyvtárat használják, saját helyi telepítéssel.
+
+### Átállás és szerverindítás
+
+1. Zárja be az alkalmazást minden gépen. Készítsen mentést a régi alkalmazás
+   mentés funkciójával, és külön másolatot az `attachment` könyvtárról.
+   Futó SQLite-adatbázisból ne csak a `.db` fájlt másolja ki, mert a WAL-ban
+   további adatok lehetnek.
+2. A létrehozott, önálló `.db.bak` mentést másolja a szerver **helyi**
+   adatkönyvtárába `engedelyek.db` néven, például
+   `C:\MEH-data\engedelyek.db`. Üres adatkönyvtár esetén új nyilvántartás
+   készül. A régi alkalmazásokat ne indítsa újra a régi adatbázison.
+3. Kérjen TLS-tanúsítványt és privát kulcsot a szervergép DNS-nevéhez
+   (a név a tanúsítvány SAN mezőjében is szerepeljen). A kliensnek bíznia
+   kell a kibocsátóban. Belső CA esetén annak nyilvános PEM-tanúsítványát
+   adja meg a kliensen; a **privát kulcs kizárólag a szerveren marad**.
+4. Generáljon véletlen hozzáférési kulcsot, például a
+   `python -c "import secrets; print(secrets.token_urlsafe(32))"` paranccsal.
+   Legalább 32 karakter szükséges. A kulcsot biztonságos csatornán adja át
+   a jogosult felhasználóknak; ne írja forráskódba vagy verziókezelt fájlba.
+5. Indítsa a szolgáltatást a projekt könyvtárából, például PowerShellben:
+
+```powershell
+$env:MEH_SERVER_TOKEN = "<az előbb generált kulcs>"
+python -m core.db_service --data-dir "C:\MEH-data" --host 0.0.0.0 --port 8765 --cert "C:\MEH-tls\server.crt" --key "C:\MEH-tls\server.key"
+```
+
+A folyamat előtérben fut; a konzol bezárása leállítja. Tartós üzemhez az
+üzemeltető állítson be Windows-szolgáltatást/felügyelt indítást vagy
+Linuxon systemd-egységet, azonos környezeti változókkal és helyi
+adatkönyvtárral. Egyetlen szolgáltatáspéldányt futtasson. A tűzfalon csak
+a szükséges belső kliensgépeknek engedje a 8765/TCP portot; ne tegye
+közvetlenül elérhetővé az interneten. Titkosítatlan HTTP csak
+`127.0.0.1`/`localhost` címen, helyi fejlesztési próbához engedélyezett.
+
+### Kliensbeállítás minden felhasználó gépén
+
+```powershell
+$env:MEH_SERVER_URL = "https://meh-szerver:8765"
+$env:MEH_SERVER_TOKEN = "<ugyanaz a hozzáférési kulcs>"
+$env:MEH_SERVER_CA_FILE = "C:\MEH-tls\ca.crt"
+$env:MEH_NETWORK_ROOT = "\\fajlszerver\megosztas\MEH"
+python main.py
+```
+
+A gépnevet és útvonalakat a saját környezethez igazítsa. A
+`MEH_SERVER_CA_FILE` elhagyható, ha a kibocsátó már megbízható a Python
+tanúsítványtárában. A fenti megosztás `attachment` alkönyvtára legyen a
+korábban használt csatolmánykönyvtár. A mappa és a `.locks` alkönyvtár
+írását minden jogosult felhasználónak engedélyezni kell. Ellenőrizze,
+hogy az állapotsor **Központi adatbázis** módot jelez; `MEH_SERVER_URL`
+nélkül a program a régi, helyi adatkezelést használja.
+
+### Párhuzamos szerkesztés és hibakezelés
+
+A lista központi módban 15 másodpercenként frissül (aktív keresés közben
+nem zavarja a gépelést); a kézi frissítés azonnal kérhető. A módosítások,
+archiválások, törlések és telephelyváltozások a többi gépen is megjelennek.
+Ugyanazt a tételt egyszerre szerkesztve az első mentés sikerül, a későbbi
+elavult mentés **ütközési hibaüzenetet** kap. A nyitott adatlap beírt adatai
+megmaradnak: másolja ki a szükséges módosításokat, zárja be, majd frissítés
+után nyissa meg újra. A program nem írja felül automatikusan más munkáját.
+A tömeges állapotmódosítás egyetlen tranzakció: ütközéskor az egész
+kijelölt művelet visszagördül.
+
+Kapcsolathibánál nincs helyi adatbázisra történő automatikus átállás.
+A korábban betöltött lista megmarad, az állapotsor jelzi, hogy elavult
+lehet. Ha a kapcsolat mentés közben szakad meg, a válasz elveszhetett
+már sikeres mentés után is: újrapróbálás előtt ellenőrizze a központi
+listát. A csatolmányok és az adatbázis külön mentési lépést használnak;
+a fájlművelet hibáját külön jelzi az alkalmazás.
+
+A végleges fájlmásolásokat megosztott zárolás védi, a méretkorlátot
+mentéskor újra ellenőrzi. Törölt engedélyek csatolmánykönyvtára
+helyreállítási célból megmarad; archiválást használjon, ha a rekordot is
+láthatóan meg szeretné őrizni. A mentések a szerver helyi `backup`
+könyvtárába kerülnek. Központi módban kliensről visszaállítás nem végezhető:
+ehhez állítsa le az összes klienst és a szolgáltatást, készítsen külön
+mentést az aktuális állapotról, majd a szerveren használja a SQLite
+backup API-ját (a `Database.restore_backup` metódust). Ezután indítson
+új munkamenetet minden kliensen. Az adatbázismentés továbbra sem
+tartalmazza a közös csatolmányokat.
+
+A hozzáférési kulcs közös alkalmazás-hozzáférést ad, nem személyenkénti
+bejelentkezés vagy jogosultságkezelés. A csatolmányok hozzáférését a
+fájlmegosztás jogosultságai szabályozzák.
 
 ## Ellenőrzés
 

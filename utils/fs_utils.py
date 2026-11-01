@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -79,6 +80,22 @@ def release_lockfile(fd: int, lock_path: Path) -> None:
         Path(lock_path).unlink(missing_ok=True)
     except Exception:
         pass
+
+
+@contextmanager
+def attachment_write_lock(directory: Path):
+    """Serialize final attachment changes across clients on the shared folder."""
+    lock_dir = directory.parent / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{directory.name}.lock"
+    try:
+        fd = create_lockfile(lock_path, timeout_sec=10)
+    except RuntimeError as exc:
+        raise OSError("Másik felhasználó csatolmányt ment; próbálja újra később.") from exc
+    try:
+        yield
+    finally:
+        release_lockfile(fd, lock_path)
 
 
 def safe_copy_to_dir(src: Path, dst_dir: Path, name_hint: Optional[str] = None, overwrite: bool = False) -> Path:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-import time
+from uuid import uuid4
 from pathlib import Path
 from typing import Dict
 
@@ -45,7 +45,7 @@ def get_app_root(network_root: Path | None = None, raise_on_fail: bool = False) 
         try:
             candidate = Path(network_root).expanduser().resolve()
             candidate.mkdir(parents=True, exist_ok=True)
-            test_file = candidate / f".writetest_{int(time.time())}"
+            test_file = candidate / f".writetest_{uuid4().hex}"
             test_file.write_text("ok", encoding="utf-8")
             test_file.unlink(missing_ok=True)
             return candidate

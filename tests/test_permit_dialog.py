@@ -46,6 +46,50 @@ class PermitDialogTests(unittest.TestCase):
     def test_dialog_fits_smaller_screen(self):
         self.assertLessEqual(self.dialog.minimumSizeHint().height(), 720)
 
+    def test_amending_decisions_visible_on_general_tab_and_files_collapsed(self):
+        tabs = self.dialog.findChild(QTabWidget)
+        self.assertTrue(tabs.widget(0).isAncestorOf(self.dialog.modosito_list))
+        self.assertTrue(self.dialog.attach_list.isHidden())
+        self.dialog.attach_toggle.setChecked(True)
+        self.assertFalse(self.dialog.attach_list.isHidden())
+        self.dialog.modosito_input.setText("M/2026")
+        self.dialog._on_modosito_add()
+        self.assertEqual(self.dialog.get_data()["modosito_hat"], "M/2026")
+
+    def test_attachment_size_rechecked_at_commit_after_another_users_upload(self):
+        from config import settings
+        self.dialog._staging_dir.mkdir(parents=True)
+        (self.dialog._staging_dir / "new.txt").write_bytes(b"new")
+        destination = self.root / "attachments" / "saved"
+        destination.mkdir(parents=True)
+        (destination / "other.txt").write_bytes(b"other")
+        with patch.object(settings, "MAX_TOTAL_ATTACHMENTS_PER_RECORD", 7):
+            with self.assertRaises(OSError):
+                self.dialog.save_attachments("saved")
+        self.assertEqual((destination / "other.txt").read_bytes(), b"other")
+        self.assertTrue((self.dialog._staging_dir / "new.txt").exists())
+
+    def test_recognize_existing_attachment_passes_selected_template_without_copying(self):
+        existing = self.root / "attachments" / "permit"
+        existing.mkdir(parents=True)
+        source = existing / "document.png"
+        source.write_bytes(b"fixture")
+        dialog = EngedelyDialog(
+            engedely={"id": "permit"}, attachments_base=str(existing.parent),
+            telephelyek=[{"id": "site", "nev": "Site"}],
+        )
+        self.addCleanup(dialog.deleteLater)
+        template = object()
+        with patch.object(dialog.ocr_template_selector, "selected_template", return_value=template):
+            with patch("gui.engedely_dialog.OcrWorker") as worker:
+                dialog._recognize_selected_attachment()
+                worker.assert_called_once_with([source], dialog, template=template)
+                self.assertFalse(dialog.ocr_template_selector.isEnabled())
+                dialog._ocr_finished()
+        self.assertTrue(dialog.ocr_template_selector.isEnabled())
+        self.assertEqual(dialog.attach_list.count(), 1)
+        self.assertFalse(dialog._staging_dir.exists())
+
     def test_legacy_review_notes_are_preserved(self):
         dialog = EngedelyDialog(
             engedely={"id": "old", "felulvizsgalatok": '[{"date": "2030-01-01", "note": "Original note"}]'},
