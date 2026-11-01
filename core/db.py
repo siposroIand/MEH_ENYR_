@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 import time
 import functools
-import shutil
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import os
@@ -14,7 +13,7 @@ import logging
 from random import uniform
 import json
 
-from utils.fs_utils import create_lockfile, release_lockfile, atomic_replace
+from utils.fs_utils import create_lockfile, release_lockfile
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +29,11 @@ def retry_db(func):
             try:
                 return func(*args, **kwargs)
             except sqlite3.OperationalError as e:
+                if not any(reason in str(e).lower() for reason in ("locked", "busy")):
+                    raise
                 last_exc = e
+                if attempt == MAX_RETRIES:
+                    break
                 backoff = RETRY_INTERVAL * (2 ** (attempt - 1))
                 jitter = uniform(0, backoff * 0.1)
                 sleep_time = backoff + jitter
@@ -65,25 +68,19 @@ class Database:
 
     @contextmanager
     def get_connection(self):
-        conn = sqlite3.connect(str(self.db_path), timeout=60.0, isolation_level=None, check_same_thread=False)
+        conn = sqlite3.connect(str(self.db_path), timeout=60.0)
         conn.row_factory = sqlite3.Row
         try:
-            try:
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA synchronous=NORMAL;")
-                conn.execute("PRAGMA busy_timeout=60000;")
-            except Exception as e:
-                logger.debug("PRAGMA beállítás hiba: %s", e)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=60000;")
             yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
-            try:
-                conn.commit()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
+            conn.close()
 
     @retry_db
     def get_data_version(self) -> int:
@@ -167,6 +164,7 @@ class Database:
         ]
         with self.get_connection() as conn:
             cur = conn.cursor()
+            added_validity_column = False
             # telephelyek oszlopok
             try:
                 cur.execute("PRAGMA table_info(telephelyek)")
@@ -188,6 +186,8 @@ class Database:
                     if name not in existing:
                         try:
                             cur.execute(f"ALTER TABLE engedelyek ADD COLUMN {name} {ctype}")
+                            if name == "hataly_tipus":
+                                added_validity_column = True
                         except Exception as e:
                             logger.debug("Nem sikerült hozzáadni engedelyek oszlopot %s: %s", name, e)
             except Exception as e:
@@ -202,8 +202,11 @@ class Database:
 
             # hataly_tipus feltöltése
             try:
-                cur.execute("SELECT id, hatarozatlan, lejarat FROM engedelyek")
-                rows = cur.fetchall()
+                query = "SELECT id, hatarozatlan, lejarat FROM engedelyek"
+                if not added_validity_column:
+                    query += " WHERE hataly_tipus IS NULL OR hataly_tipus=''"
+                cur.execute(query)
+                rows = [dict(row) for row in cur.fetchall()]
                 updates = []
                 for r in rows:
                     rid = r["id"]
@@ -229,7 +232,7 @@ class Database:
             # Backfill felulvizsgalat_date where possible
             try:
                 cur.execute("SELECT id, lejarat, felulvizsgalat_nap, felulvizsgalat_date FROM engedelyek")
-                rows = cur.fetchall()
+                rows = [dict(row) for row in cur.fetchall()]
                 updates = []
                 for r in rows:
                     rid = r["id"]
@@ -252,7 +255,7 @@ class Database:
             # Backfill felulvizsgalatok JSON oszlop a meglévő adatok alapján (csak ha üres)
             try:
                 cur.execute("SELECT id, lejarat, felulvizsgalat_nap, felulvizsgalat_date, felulvizsgalatok FROM engedelyek")
-                rows = cur.fetchall()
+                rows = [dict(row) for row in cur.fetchall()]
                 updates = []
                 for r in rows:
                     rid = r["id"]
@@ -265,7 +268,7 @@ class Database:
                         try:
                             # validate format
                             _ = datetime.strptime(fv_date_existing, "%Y-%m-%d")
-                            entries.append({"date": fv_date_existing, "note": ""})
+                            entries.append({"type": "date", "date": fv_date_existing, "note": ""})
                         except Exception:
                             pass
                     fv_nap = r.get("felulvizsgalat_nap") or 0
@@ -275,7 +278,7 @@ class Database:
                             ld = datetime.strptime(lejarat, "%Y-%m-%d").date()
                             comp = (ld - timedelta(days=int(fv_nap))).isoformat()
                             if not any(e["date"] == comp for e in entries):
-                                entries.append({"date": comp, "note": f"{int(fv_nap)} nappal a lejárat előtt (számított)"})
+                                entries.append({"type": "date", "date": comp, "note": f"{int(fv_nap)} nappal a lejárat előtt (számított)"})
                         except Exception:
                             pass
                     if entries:
@@ -317,7 +320,7 @@ class Database:
         return self.backup_dir / (self.db_path.name + ".backup.lock")
 
     def _timestamped_backup_name(self) -> Path:
-        return self.backup_dir / f"{self.db_path.stem}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db.bak"
+        return self.backup_dir / f"{self.db_path.stem}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}.db.bak"
 
     def list_backups(self, limit: int = 100) -> List[Path]:
         files = sorted(self.backup_dir.glob(f"{self.db_path.stem}_*.db.bak"), key=lambda x: x.stat().st_mtime, reverse=True)
@@ -332,7 +335,9 @@ class Database:
         try:
             fd = create_lockfile(lock_path, timeout_sec=20)
             bak = self._timestamped_backup_name()
-            shutil.copy2(self.db_path, bak)
+            with closing(sqlite3.connect(str(self.db_path))) as source:
+                with closing(sqlite3.connect(str(bak))) as destination:
+                    source.backup(destination)
             # rotate
             all_backups = sorted(self.backup_dir.glob(f"{self.db_path.stem}_*.db.bak"), key=lambda x: x.stat().st_mtime, reverse=True)
             for old in all_backups[keep:]:
@@ -357,16 +362,11 @@ class Database:
         fd = None
         try:
             fd = create_lockfile(lock_path, timeout_sec=30)
-            tmp_restore = self.db_path.with_suffix(".restore_tmp")
-            try:
-                shutil.copy2(backup_path, tmp_restore)
-                atomic_replace(tmp_restore, self.db_path)
-            finally:
-                try:
-                    if tmp_restore.exists():
-                        tmp_restore.unlink()
-                except Exception:
-                    pass
+            with closing(sqlite3.connect(backup_path.resolve().as_uri() + "?mode=ro", uri=True)) as source:
+                if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise sqlite3.DatabaseError("A biztonsági mentés sérült.")
+                with self.get_connection() as destination:
+                    source.backup(destination)
             logger.info("Backup visszaállítva: %s", backup_path)
             return True
         finally:
