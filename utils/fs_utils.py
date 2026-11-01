@@ -3,13 +3,28 @@ from __future__ import annotations
 import os
 import shutil
 import time
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import re
 
+from config import settings
+
 _FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_\-\.]")
+
+
+def validate_attachment(src: Path, current_total: int = 0) -> None:
+    if not src.is_file():
+        raise FileNotFoundError(str(src))
+    if src.suffix.lower() in settings.FORBIDDEN_EXTENSIONS:
+        raise ValueError("Tiltott fájltípus.")
+    size = src.stat().st_size
+    if size > settings.MAX_ATTACHMENT_SIZE:
+        raise ValueError(f"A fájl mérete meghaladja a {settings.MAX_ATTACHMENT_SIZE // (1024 * 1024)} MB-os korlátot.")
+    if current_total + size > settings.MAX_TOTAL_ATTACHMENTS_PER_RECORD:
+        raise ValueError("A csatolmányok összmérete meghaladná a megengedett korlátot.")
 
 
 def sanitize_filename(name: str, max_length: int = 180) -> str:
@@ -76,16 +91,28 @@ def safe_copy_to_dir(src: Path, dst_dir: Path, name_hint: Optional[str] = None, 
     candidate_name = name_hint or src.name
     safe_name = sanitize_filename(candidate_name)
     target = dst_dir / safe_name
-
-    if target.exists() and not overwrite:
-        stem, ext = os.path.splitext(safe_name)
-        counter = 1
-        while True:
-            new_name = f"{stem}_{counter}{ext}"
-            target = dst_dir / new_name
-            if not target.exists():
-                break
-            counter += 1
-
-    shutil.copy2(str(src), str(target))
-    return target
+    with tempfile.NamedTemporaryFile(dir=dst_dir, prefix=".copy_", delete=False) as stream:
+        temporary = Path(stream.name)
+    reserved = False
+    try:
+        shutil.copy2(src, temporary)
+        if not overwrite:
+            stem, ext = os.path.splitext(safe_name)
+            counter = 0
+            while True:
+                try:
+                    # Reserve the name exclusively, including across concurrent processes.
+                    with target.open("xb"):
+                        pass
+                    reserved = True
+                    break
+                except FileExistsError:
+                    counter += 1
+                    target = dst_dir / f"{stem}_{counter}{ext}"
+        os.replace(temporary, target)
+        reserved = False
+        return target
+    finally:
+        if reserved:
+            target.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)

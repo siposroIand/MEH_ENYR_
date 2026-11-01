@@ -10,12 +10,12 @@ Felülvizsgálat: egyszerűsítve — csak FIX dátum vagy "n nappal a lejárat 
 """
 from __future__ import annotations
 
-import shutil
 import mimetypes
 import subprocess
 import json
+import logging
 from uuid import uuid4
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set
 
@@ -24,11 +24,16 @@ from PySide6.QtWidgets import (
     QComboBox, QCheckBox, QDateEdit, QSpinBox, QPushButton, QListWidget,
     QListWidgetItem, QFileDialog, QMessageBox, QGroupBox, QWidget, QTabWidget,
     QDialogButtonBox, QSizePolicy, QRadioButton, QButtonGroup, QCompleter,
-    QSplitter, QInputDialog
+    QSplitter, QInputDialog, QScrollArea
 )
 from PySide6.QtCore import Qt, QDate
 
 from config.app_config import get_ordered_categories
+from core.document_ocr import DocumentFields, SUPPORTED_EXTENSIONS
+from gui.ocr_worker import OcrWorker
+from utils.fs_utils import safe_copy_to_dir, validate_attachment
+
+logger = logging.getLogger(__name__)
 
 
 def qdate_to_iso(qd: QDate) -> str:
@@ -189,8 +194,15 @@ class EngedelyDialog(QDialog):
         self.resize(1100, 720)
 
         self.engedely = engedely or {}
-        self.temp_id = str(uuid4()) if not engedely else None
+        self.temp_id = str(uuid4())
         self.attachments_base = Path(attachments_base) if attachments_base else Path.cwd() / "attachment"
+        self._staging_dir = self.attachments_base / f"temp_{self.temp_id}"
+        self._deleted_attachments: set[Path] = set()
+        self._copied_attachments: Dict[Path, Path] = {}
+        self._ocr_worker: Optional[OcrWorker] = None
+        self._pending_close: Optional[int] = None
+        self._subject_revision = 0
+        self._validity_revision = 0
 
         # internal list of felulvizsgalat entries: list of typed dicts
         self.felulvizsgalatok: List[Dict[str, Any]] = []
@@ -198,6 +210,10 @@ class EngedelyDialog(QDialog):
         self._build_ui(telephelyek or [], hatosag_lista or [])
         self._populate_from_entity()
         self.load_attachments()
+        self.targy.textChanged.connect(self._subject_changed)
+        self.hatary_date.dateChanged.connect(self._validity_changed)
+        for radio in (self.rb_fixed, self.rb_indef, self.rb_until_mod):
+            radio.toggled.connect(self._validity_changed)
         # enable waste tab initially depending on category
         self.on_category_changed(self.kategoria.currentText())
 
@@ -368,14 +384,10 @@ class EngedelyDialog(QDialog):
         fv_entries_row.addLayout(fv_buttons_v)
         fv_v.addLayout(fv_entries_row)
 
-    # --- környező rész a fájlból ---
         self.next_review_lbl = QLabel("")
-        # korábban: self.next_review_lbl.setStyleSheet("font-weight: bold;")
-        # új: legyen vastag és piros a figyelem felkeltéséhez
         self.next_review_lbl.setStyleSheet("font-weight: bold; color: red;")
         fv_v.addWidget(self.next_review_lbl)
-        # --- vége ---
-        fv_v.addWidget(self.next_review_lbl)
+        self.hatary_date.dateChanged.connect(self._on_hataly_changed)
 
         form_right.addRow(fv_box)
         right_v.addWidget(right_box)
@@ -389,7 +401,10 @@ class EngedelyDialog(QDialog):
         splitter.setSizes([600, 480])
 
         gen_layout.addWidget(splitter)
-        tabs.addTab(gen_w, "Általános")
+        general_scroll = QScrollArea()
+        general_scroll.setWidgetResizable(True)
+        general_scroll.setWidget(gen_w)
+        tabs.addTab(general_scroll, "Általános")
 
         # ---------- Hulladék (simple rows) ----------
         waste_w = QWidget()
@@ -423,16 +438,17 @@ class EngedelyDialog(QDialog):
         tabs.setTabEnabled(tabs.indexOf(waste_w), False)
 
         # ---------- Csatolmányok ----------
-        att_w = QWidget()
+        att_w = QGroupBox("Csatolmányok – automatikus adatfelismerés")
         att_layout = QHBoxLayout(att_w)
         left_att_col = QVBoxLayout()
         left_att_col.addWidget(QLabel("Csatolt fájlok:"))
         self.attach_list = QListWidget()
+        self.attach_list.setMaximumHeight(90)
         left_att_col.addWidget(self.attach_list)
         att_layout.addLayout(left_att_col, 1)
 
         right_att_col = QVBoxLayout()
-        self.attach_add = QPushButton("+ Fájl hozzáadása")
+        self.attach_add = QPushButton("Fájl tallózása…")
         self.attach_del = QPushButton("- Fájl törlése")
         self.attach_view = QPushButton("👁 Megtekintés")
         right_att_col.addWidget(self.attach_add)
@@ -443,11 +459,15 @@ class EngedelyDialog(QDialog):
         self.attach_add.clicked.connect(self.add_attachment)
         self.attach_del.clicked.connect(self.remove_attachment)
         self.attach_view.clicked.connect(self.view_attachment)
-        tabs.addTab(att_w, "Csatolmányok")
+        gen_layout.insertWidget(0, att_w)
+        self.ocr_status = QLabel("PDF vagy kép tallózásakor a tárgy és a hatály automatikusan kitöltődik.")
+        self.ocr_status.setWordWrap(True)
+        gen_layout.insertWidget(1, self.ocr_status)
 
         # buttons (Save/Cancel)
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         save_btn = btns.button(QDialogButtonBox.Save)
+        self.save_btn = save_btn
         save_btn.setText("Mentés")
         cancel_btn = btns.button(QDialogButtonBox.Cancel)
         cancel_btn.setText("Mégse")
@@ -538,6 +558,7 @@ class EngedelyDialog(QDialog):
     def _on_hataly_changed(self, _=None) -> None:
         # hatály/változás állapot változásakor frissítjük a felülvizsgálati megjelenítést
         # (a részletes felülvizsgálati módválasztás a Hozzáadás párbeszédben történik)
+        self.hatary_date.setEnabled(self.rb_fixed.isChecked())
         self._update_fv_entries_list()
 
     # ---------------- populate ----------------
@@ -595,8 +616,11 @@ class EngedelyDialog(QDialog):
                         parsed = fv_list_raw
                     if isinstance(parsed, list):
                         for it in parsed:
-                            if isinstance(it, dict) and it.get("type") in ("date", "before_expiry"):
-                                self.felulvizsgalatok.append(it)
+                            if isinstance(it, dict):
+                                if not it.get("type") and iso_to_qdate(it.get("date")):
+                                    it = {**it, "type": "date"}
+                                if it.get("type") in ("date", "before_expiry"):
+                                    self.felulvizsgalatok.append(it)
                 except Exception:
                     self.felulvizsgalatok = []
 
@@ -779,7 +803,7 @@ class EngedelyDialog(QDialog):
         else:
             self.next_review_lbl.setText("Következő felülvizsgálat: nincs jövőbeli bejegyzés (csak fix dátumok számíthatók)")
 
-    # ---------------- attachments (unchanged) ----------------
+    # ---------------- attachments / OCR ----------------
     def get_attach_dir(self) -> Path:
         if self.engedely and self.engedely.get("id"):
             return self.attachments_base / self.engedely["id"]
@@ -788,55 +812,182 @@ class EngedelyDialog(QDialog):
 
     def load_attachments(self) -> None:
         self.attach_list.clear()
-        adir = self.get_attach_dir()
-        if adir.exists() and adir.is_dir():
-            for fname in sorted([p.name for p in adir.iterdir() if p.is_file()]):
-                self.attach_list.addItem(fname)
+        directories = {self.get_attach_dir(), self._staging_dir}
+        try:
+            for adir in sorted(directories):
+                if adir.is_dir():
+                    for path in sorted(adir.iterdir()):
+                        if path.is_file() and path not in self._deleted_attachments:
+                            item = QListWidgetItem(path.name)
+                            item.setData(Qt.UserRole, path)
+                            self.attach_list.addItem(item)
+        except OSError as exc:
+            logger.exception("Attachment listing failed")
+            QMessageBox.warning(self, "Csatolmányok", f"A csatolmányok nem olvashatók: {exc}")
 
     def add_attachment(self) -> None:
+        if self._ocr_worker is not None:
+            return
         files, _ = QFileDialog.getOpenFileNames(self, "Fájl(ok) kiválasztása", str(Path.home()), "Minden fájl (*.*)")
         if not files:
             return
-        adir = self.get_attach_dir()
-        adir.mkdir(parents=True, exist_ok=True)
+        ocr_paths = []
         for f in files:
             src = Path(f)
-            dest = adir / src.name
             try:
-                if dest.exists():
-                    stem, ext = dest.stem, dest.suffix
-                    dest = adir / f"{stem}_{int(datetime.now().timestamp())}{ext}"
-                shutil.copy2(str(src), str(dest))
-            except Exception as e:
+                total = sum(
+                    self.attach_list.item(i).data(Qt.UserRole).stat().st_size
+                    for i in range(self.attach_list.count())
+                )
+                validate_attachment(src, total)
+                dest = safe_copy_to_dir(src, self._staging_dir)
+                self.load_attachments()
+                if dest.suffix.lower() in SUPPORTED_EXTENSIONS:
+                    ocr_paths.append(dest)
+            except (OSError, ValueError) as e:
+                logger.warning("Attachment copy failed: %s", e)
                 QMessageBox.warning(self, "Hiba", f"Nem sikerült másolni: {f}\n{e}")
-        self.load_attachments()
+        if ocr_paths:
+            self._start_ocr(ocr_paths)
+        else:
+            self.ocr_status.setText("Nem került hozzáadásra OCR-rel feldolgozható PDF vagy kép.")
+
+    def _subject_changed(self, *_args) -> None:
+        self._subject_revision += 1
+
+    def _validity_changed(self, *_args) -> None:
+        self._validity_revision += 1
+
+    def _start_ocr(self, paths: List[Path]) -> None:
+        self._ocr_revisions = (self._subject_revision, self._validity_revision)
+        self.ocr_status.setText("Dokumentumok feldolgozása… Az adatmezők közben szerkeszthetők.")
+        for button in (self.attach_add, self.attach_del, self.save_btn):
+            button.setEnabled(False)
+        self._ocr_worker = OcrWorker(paths, self)
+        self._ocr_worker.result_ready.connect(self._apply_ocr)
+        self._ocr_worker.finished.connect(self._ocr_finished)
+        self._ocr_worker.start()
+
+    def _apply_ocr(self, fields: DocumentFields, errors: List[str]) -> None:
+        if self._pending_close is not None:
+            return
+        messages = list(fields.warnings)
+        updated = []
+        if fields.subject:
+            if self._subject_revision != self._ocr_revisions[0]:
+                messages.append("A kézzel módosított tárgyat nem írtuk felül.")
+            elif len(fields.subject) > self.targy.maxLength():
+                messages.append("A felismert tárgy túl hosszú; adja meg kézzel (legfeljebb 200 karakter).")
+            else:
+                self.targy.setText(fields.subject)
+                updated.append("tárgy")
+        if fields.validity:
+            if self._validity_revision != self._ocr_revisions[1]:
+                messages.append("A kézzel módosított hatályt nem írtuk felül.")
+            elif fields.validity == "fixed" and fields.expiry:
+                value = QDate(fields.expiry.year, fields.expiry.month, fields.expiry.day)
+                if self.hatary_date.minimumDate() <= value <= self.hatary_date.maximumDate():
+                    self.rb_fixed.setChecked(True)
+                    self.hatary_date.setDate(value)
+                    updated.append("lejárat")
+                else:
+                    messages.append("A felismert dátum az engedélyezett tartományon kívül esik.")
+            elif fields.validity == "indefinite":
+                self.rb_indef.setChecked(True)
+                updated.append("hatály")
+            elif fields.validity == "until_modified":
+                self.rb_until_mod.setChecked(True)
+                updated.append("hatály")
+        if updated:
+            messages.insert(0, f"Kitöltve: {', '.join(updated)}. Mentés előtt ellenőrizze a felismert adatokat.")
+        else:
+            messages.insert(0, "Nem történt automatikus kitöltés; a mezők kézzel megadhatók.")
+        if not fields.subject:
+            messages.append("Nem található egyértelmű „Tárgy:” érték.")
+        if not fields.validity:
+            messages.append("Nem található egyértelmű „Hatályos:” vagy „Érvényes:” érték.")
+        if errors:
+            messages.append("Egyes dokumentumok felismerése sikertelen.")
+            QMessageBox.warning(self, "OCR", "\n\n".join(errors))
+        self.ocr_status.setText("\n".join(messages))
+
+    def _ocr_finished(self) -> None:
+        worker = self._ocr_worker
+        self._ocr_worker = None
+        if worker:
+            worker.deleteLater()
+        for button in (self.attach_add, self.attach_del, self.save_btn):
+            button.setEnabled(True)
+        if self._pending_close is not None:
+            result = self._pending_close
+            self._pending_close = None
+            self.done(result)
+
+    def done(self, result: int) -> None:
+        if self._ocr_worker is not None:
+            if result == QDialog.Accepted:
+                return
+            self._pending_close = result
+            self._ocr_worker.requestInterruption()
+            self.ocr_status.setText("OCR megszakítása… A folyamatban lévő oldal befejezésére várunk.")
+            return
+        if result == QDialog.Rejected:
+            try:
+                if self._staging_dir.exists():
+                    for path in self._staging_dir.iterdir():
+                        path.unlink()
+                    self._staging_dir.rmdir()
+            except OSError as exc:
+                logger.exception("Attachment staging cleanup failed")
+                QMessageBox.warning(self, "Csatolmányok", f"Az ideiglenes fájlok nem törölhetők: {exc}")
+        super().done(result)
+
+    def closeEvent(self, event) -> None:
+        if self._ocr_worker is not None:
+            self.reject()
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
+    def save_attachments(self, entity_id: str) -> None:
+        """Commit staged changes only after the permit was saved successfully."""
+        destination = self.attachments_base / entity_id
+        if self._staging_dir.exists():
+            destination.mkdir(parents=True, exist_ok=True)
+            for path in self._staging_dir.iterdir():
+                if path not in self._copied_attachments:
+                    self._copied_attachments[path] = safe_copy_to_dir(path, destination)
+                path.unlink()
+                self._copied_attachments.pop(path)
+            self._staging_dir.rmdir()
+        for path in tuple(self._deleted_attachments):
+            path.unlink(missing_ok=True)
+            self._deleted_attachments.remove(path)
 
     def remove_attachment(self) -> None:
+        if self._ocr_worker is not None:
+            return
         sel = self.attach_list.currentItem()
         if not sel:
             return
         fname = sel.text()
         if QMessageBox.question(self, "Törlés", f"Tényleg törli a kiválasztott fájlt?\n{fname}") != QMessageBox.Yes:
             return
-        fpath = self.get_attach_dir() / fname
+        fpath = sel.data(Qt.UserRole)
         try:
-            if fpath.exists():
+            if fpath.parent == self._staging_dir:
                 fpath.unlink()
-            adir = self.get_attach_dir()
-            if adir.exists() and not any(adir.iterdir()):
-                try:
-                    adir.rmdir()
-                except Exception:
-                    pass
+            else:
+                self._deleted_attachments.add(fpath)
             self.load_attachments()
-        except Exception as e:
+        except OSError as e:
             QMessageBox.warning(self, "Hiba", f"Nem sikerült törölni: {e}")
 
     def view_attachment(self) -> None:
         sel = self.attach_list.currentItem()
         if not sel:
             return
-        fpath = self.get_attach_dir() / sel.text()
+        fpath = sel.data(Qt.UserRole)
         if not fpath.exists():
             QMessageBox.warning(self, "Hiba", "Fájl nem található.")
             self.load_attachments()
@@ -912,8 +1063,8 @@ class EngedelyDialog(QDialog):
 
         # typed felulvizsgalatok
         self._sanitize_review_entries()
+        data["felulvizsgalatok"] = self.felulvizsgalatok.copy()
         if self.felulvizsgalatok:
-            data["felulvizsgalatok"] = self.felulvizsgalatok.copy()
             date_entries = [it for it in self.felulvizsgalatok if it.get("type") == "date"]
             before_entries = [it for it in self.felulvizsgalatok if it.get("type") == "before_expiry"]
             if len(date_entries) == 1 and not data.get("felulvizsgalat_date"):
@@ -938,15 +1089,12 @@ class EngedelyDialog(QDialog):
                 "hulladek_nv_gyujt": None, "hulladek_v_gyujt": None
             })
 
-        data["attachments_temp"] = None
-        if not self.engedely:
-            tmp = self.get_attach_dir()
-            if tmp.exists() and any(tmp.iterdir()):
-                data["attachments_temp"] = str(tmp)
         return data
 
     # ---------------- validation / accept ----------------
     def _on_accept(self) -> None:
+        if self._ocr_worker is not None:
+            return
         if not self.telephely_combo.currentData():
             QMessageBox.warning(self, "Hiányzó adat", "Válasszon telephelyet a legördülőből.")
             return

@@ -89,7 +89,7 @@ from gui.ui_texts import (
 from gui.ui_helpers import confirm, info, warning, error
 
 from config import settings
-from utils.fs_utils import sanitize_filename, safe_copy_to_dir
+from utils.fs_utils import sanitize_filename, safe_copy_to_dir, validate_attachment
 
 logger = logging.getLogger("engedely_nyilvantarto")
 if not logger.handlers:
@@ -772,69 +772,7 @@ class MainWindow(QMainWindow):
             logger.exception("run_report failed: %s", ex)
             error(self, "Export hiba", ERR_EXPORT_FAILED.format(detail=str(ex)))
 
-    # ---------------- helper: attachment validation & move ----------------
-    def _is_extension_allowed(self, path: Path) -> bool:
-        ext = path.suffix.lower()
-        return ext not in settings.FORBIDDEN_EXTENSIONS
-
-    def _format_mb(self, size_bytes: int) -> str:
-        return f"{size_bytes / (1024*1024):.1f}"
-
-    def _move_attachments_from_temp(self, tmp_attach_p: Path, real_attach: Path) -> Dict[str, List[str]]:
-        """
-        Mozgatja a temp csatolmányokat a valós helyre, miközben ellenőrzi a méretet és kiterjesztést.
-        Visszatér egy dict-tel: {"moved": [..], "skipped": [..], "errors":[..]}
-        """
-        result = {"moved": [], "skipped": [], "errors": []}
-        if not tmp_attach_p.exists():
-            return result
-        real_attach.mkdir(parents=True, exist_ok=True)
-        for f in tmp_attach_p.iterdir():
-            try:
-                if not f.is_file():
-                    continue
-                try:
-                    size = f.stat().st_size
-                except Exception:
-                    size = 0
-                if size > settings.MAX_ATTACHMENT_SIZE:
-                    result["skipped"].append(f.name)
-                    logger.warning("Attachment skipped (too large): %s (%s MB)", f, self._format_mb(size))
-                    continue
-                if not self._is_extension_allowed(f):
-                    result["skipped"].append(f.name)
-                    logger.warning("Attachment skipped (forbidden ext): %s", f)
-                    continue
-                # safe name and move
-                safe_name = sanitize_filename(f.name)
-                target = real_attach / safe_name
-                # ensure no overwrite unless needed: give unique name if exists
-                if target.exists():
-                    stem, ext = os.path.splitext(safe_name)
-                    idx = 1
-                    while True:
-                        candidate = real_attach / f"{stem}_{idx}{ext}"
-                        if not candidate.exists():
-                            target = candidate
-                            break
-                        idx += 1
-                try:
-                    shutil.move(str(f), str(target))
-                    result["moved"].append(target.name)
-                except Exception as e:
-                    logger.exception("Failed moving attachment %s -> %s: %s", f, target, e)
-                    result["errors"].append(f.name)
-            except Exception as e:
-                logger.exception("Unexpected error while moving attachment %s: %s", f, e)
-                result["errors"].append(f.name if f else "unknown")
-        # cleanup tmp dir if empty
-        try:
-            if tmp_attach_p.exists() and not any(tmp_attach_p.iterdir()):
-                tmp_attach_p.rmdir()
-        except Exception:
-            pass
-        return result
-
+    # ---------------- attachment import ----------------
     def _add_files_to_entity(self, ent: Dict[str, Any], paths: List[str]) -> None:
         """
         Add local files (paths) into the attachments dir of a given entity.
@@ -846,47 +784,21 @@ class MainWindow(QMainWindow):
             return
         eid = ent["id"]
         real_attach = self.ATTACHMENTS_DIR / eid
-        real_attach.mkdir(parents=True, exist_ok=True)
         moved = []
         skipped = []
         errors = []
         for p in paths:
             try:
                 pth = Path(p)
-                if not pth.exists() or not pth.is_file():
-                    skipped.append(pth.name if pth.name else str(p))
-                    continue
-                try:
-                    size = pth.stat().st_size
-                except Exception:
-                    size = 0
-                if size > settings.MAX_ATTACHMENT_SIZE:
-                    skipped.append(pth.name)
-                    logger.warning("Dropped attachment skipped (too large): %s (%s MB)", pth, self._format_mb(size))
-                    continue
-                if not self._is_extension_allowed(pth):
-                    skipped.append(pth.name)
-                    logger.warning("Dropped attachment skipped (forbidden ext): %s", pth)
-                    continue
-                safe_name = sanitize_filename(pth.name)
-                target = real_attach / safe_name
-                if target.exists():
-                    stem, ext = os.path.splitext(safe_name)
-                    idx = 1
-                    while True:
-                        candidate = real_attach / f"{stem}_{idx}{ext}"
-                        if not candidate.exists():
-                            target = candidate
-                            break
-                        idx += 1
-                try:
-                    shutil.copy2(str(pth), str(target))
-                    moved.append(target.name)
-                except Exception as e:
-                    logger.exception("Failed copying dropped file %s -> %s: %s", pth, target, e)
-                    errors.append(pth.name)
-            except Exception as e:
-                logger.exception("Unexpected error while processing dropped file %s: %s", p, e)
+                total = sum(f.stat().st_size for f in real_attach.iterdir() if f.is_file()) if real_attach.exists() else 0
+                validate_attachment(pth, total)
+                target = safe_copy_to_dir(pth, real_attach)
+                moved.append(target.name)
+            except ValueError as e:
+                logger.warning("Dropped attachment skipped: %s", e)
+                skipped.append(f"{Path(p).name}: {e}")
+            except OSError as e:
+                logger.exception("Failed copying dropped file %s: %s", p, e)
                 errors.append(Path(p).name if Path(p).name else str(p))
         # update cache and UI
         try:
@@ -1536,60 +1448,15 @@ class MainWindow(QMainWindow):
                 return
             new_id = str(uuid4()); now = datetime.utcnow().isoformat()
             try:
-                # prepare felulvizsgalatok JSON (if present)
-                felu_json = None
-                if d.get("felulvizsgalatok"):
-                    try:
-                        felu_json = json.dumps(d.get("felulvizsgalatok"), ensure_ascii=False)
-                    except Exception:
-                        felu_json = None
-
-                with self.db.get_connection() as conn:
-                    conn.execute("""
-                        INSERT INTO engedelyek (
-                            id, telephely_id, engedely_nev, kategoria, kiado_hatosag, hatarozatszam,
-                            modosito_hat, letrejott, hatarozatlan, lejarat, hataly_tipus, felulvizsgalat_nap, felulvizsgalat_date, felulvizsgalatok, megjegyzes, archivalt,
-                            hulladek_nv_elokez, hulladek_v_elokez, hulladek_nv_gyujt, hulladek_v_gyujt, last_modified, deleted
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (new_id, d["telephely_id"], d["engedely_nev"], d["kategoria"],
-                          d["kiado_hatosag"], d["hatarozatszam"], d.get("modosito_hat"),
-                          d.get("letrejott"), d.get("hatarozatlan", 0), d.get("lejarat"),
-                          d.get("hataly_tipus", "fixed"), d.get("felulvizsgalat_nap", 0), d.get("felulvizsgalat_date"),
-                          felu_json, d.get("megjegyzes"), 0,
-                          d.get("hulladek_nv_elokez"), d.get("hulladek_v_elokez"), d.get("hulladek_nv_gyujt"), d.get("hulladek_v_gyujt"),
-                          now, 0))
-                tmp_attach = d.get("attachments_temp")
-                if tmp_attach:
-                    tmp_attach_p = Path(tmp_attach)
-                    if tmp_attach_p.exists():
-                        real_attach = self.ATTACHMENTS_DIR / new_id
-                        moved = self._move_attachments_from_temp(tmp_attach_p, real_attach)
-                        skipped = moved.get("skipped") or []
-                        if skipped:
-                            warning(self, "Csatolmányok", f"{len(skipped)} fájl nem került átmásolásra a korlátozások miatt: {', '.join(skipped)}")
+                self._persist_permit(d, new_id, now)
+                self._save_dialog_attachments(dlg, new_id)
                 self._safe_log("engedely_insert")
-                try:
-                    rec = {
-                        "id": new_id, "telephely_id": d["telephely_id"], "engedely_nev": d["engedely_nev"],
-                        "kategoria": d["kategoria"], "kiado_hatosag": d.get("kiado_hatosag"), "hatarozatszam": d["hatarozatszam"],
-                        "modosito_hat": d.get("modosito_hat"), "letrejott": d.get("letrejott"), "hatarozatlan": d.get("hatarozatlan", 0),
-                        "lejarat": d.get("lejarat"), "hataly_tipus": d.get("hataly_tipus", "fixed"),
-                        "felulvizsgalat_nap": d.get("felulvizsgalat_nap", 0), "felulvizsgalat_date": d.get("felulvizsgalat_date"),
-                        "megjegyzes": d.get("megjegyzes"), "archivalt": 0,
-                        "hulladek_nv_elokez": d.get("hulladek_nv_elokez"), "hulladek_v_elokez": d.get("hulladek_v_elokez"),
-                        "hulladek_nv_gyujt": d.get("hulladek_nv_gyujt"), "hulladek_v_gyujt": d.get("hulladek_v_gyujt"),
-                        "last_modified": now, "deleted": 0
-                    }
-                    # include felulvizsgalatok in-memory if provided by dialog (DB column may not exist)
-                    if d.get("felulvizsgalatok"):
-                        rec["felulvizsgalatok"] = d.get("felulvizsgalatok")
-                    self.data["engedelyek"].insert(0, rec)
-                except Exception:
-                    self.refresh_data(incremental=False)
+                self.refresh_data(incremental=False)
                 self.refresh_table()
-            except sqlite3.OperationalError as e:
+            except sqlite3.DatabaseError as e:
                 logger.exception("add_engedely OperationalError: %s", e)
                 error(self, "Adatbázis", f"Adatbázis hiba: {e}")
+                self._retry_permit_save(dlg, new_id)
 
     def edit_eng(self, eng: Dict[str, Any]) -> None:
         if EngedelyDialog is None:
@@ -1604,138 +1471,77 @@ class MainWindow(QMainWindow):
                 return
             now = datetime.utcnow().isoformat()
             try:
-                # prepare felulvizsgalatok JSON (if present)
-                felu_json = None
-                if d.get("felulvizsgalatok"):
-                    try:
-                        felu_json = json.dumps(d.get("felulvizsgalatok"), ensure_ascii=False)
-                    except Exception:
-                        felu_json = None
-
-                with self.db.get_connection() as conn:
-                    conn.execute("""
-                        UPDATE engedelyek SET
-                        telephely_id=?, engedely_nev=?, kategoria=?, kiado_hatosag=?,
-                        hatarozatszam=?, modosito_hat=?, letrejott=?, hatarozatlan=?,
-                        lejarat=?, hataly_tipus=?, felulvizsgalat_nap=?, felulvizsgalat_date=?, felulvizsgalatok=?, megjegyzes=?,
-                        hulladek_nv_elokez=?, hulladek_v_elokez=?, hulladek_nv_gyujt=?, hulladek_v_gyujt=?, last_modified=?
-                        WHERE id=?
-                    """, (d["telephely_id"], d["engedely_nev"], d["kategoria"], d.get("kiado_hatosag"),
-                          d["hatarozatszam"], d.get("modosito_hat"), d.get("letrejott"), d.get("hatarozatlan", 0),
-                          d.get("lejarat"), d.get("hataly_tipus", "fixed"), d.get("felulvizsgalat_nap", 0), d.get("felulvizsgalat_date"),
-                          felu_json, d.get("megjegyzes"),
-                          d.get("hulladek_nv_elokez"), d.get("hulladek_v_elokez"), d.get("hulladek_nv_gyujt"), d.get("hulladek_v_gyujt"),
-                          now, eng["id"]))
-                tmp_attach = d.get("attachments_temp")
-                if tmp_attach:
-                    tmp_attach_p = Path(tmp_attach)
-                    if tmp_attach_p.exists():
-                        real_attach = self.ATTACHMENTS_DIR / eng["id"]
-                        moved = self._move_attachments_from_temp(tmp_attach_p, real_attach)
-                        skipped = moved.get("skipped") or []
-                        if skipped:
-                            warning(self, "Csatolmányok", f"{len(skipped)} fájl nem került átmásolásra a korlátozások miatt: {', '.join(skipped)}")
-                        # invalidate cache for this id
-                        self._attachments_cache.pop(eng["id"], None)
+                self._persist_permit(d, eng["id"], now, updating=True)
+                self._save_dialog_attachments(dlg, eng["id"])
                 self._safe_log("engedely_update")
-                try:
-                    idx = next((i for i, x in enumerate(self.data.get("engedelyek", [])) if x.get("id") == eng.get("id")), None)
-                    if idx is not None:
-                        self.data["engedelyek"][idx].update({
-                            "telephely_id": d["telephely_id"], "engedely_nev": d["engedely_nev"], "kategoria": d["kategoria"],
-                            "kiado_hatosag": d.get("kiado_hatosag"), "hatarozatszam": d["hatarozatszam"], "modosito_hat": d.get("modosito_hat"),
-                            "letrejott": d.get("letrejott"), "hatarozatlan": d.get("hatarozatlan", 0), "lejarat": d.get("lejarat"),
-                            "hataly_tipus": d.get("hataly_tipus", "fixed"), "felulvizsgalat_nap": d.get("felulvizsgalat_nap", 0),
-                            "felulvizsgalat_date": d.get("felulvizsgalat_date"), "megjegyzes": d.get("megjegyzes"), "hulladek_nv_elokez": d.get("hulladek_nv_elokez"),
-                            "hulladek_v_elokez": d.get("hulladek_v_elokez"), "hulladek_nv_gyujt": d.get("hulladek_nv_gyujt"),
-                            "hulladek_v_gyujt": d.get("hulladek_v_gyujt"), "last_modified": now
-                        })
-                        # include felulvizsgalatok in-memory if provided by dialog
-                        if d.get("felulvizsgalatok"):
-                            self.data["engedelyek"][idx]["felulvizsgalatok"] = d.get("felulvizsgalatok")
-                        # update precomputed fields for this record (recompute _fv_list/_next_fv for immediate UI)
-                        updated = self.data["engedelyek"][idx]
-                        tp_name = next((t["nev"] for t in self.data.get("telephelyek", []) if t["id"] == updated.get("telephely_id")), "")
-                        fields = " ".join([str(v) for v in (
-                            updated.get("engedely_nev") or "", updated.get("hatarozatszam") or "",
-                            updated.get("modosito_hat") or "", updated.get("kiado_hatosag") or "",
-                            updated.get("megjegyzes") or "", updated.get("kategoria") or "", tp_name
-                        )])
-                        updated["_search_index"] = fields.casefold()
-                        # recompute parsed dates similar to refresh_data logic
-                        try:
-                            if updated.get("lejarat"):
-                                updated["_lej_dt"] = datetime.strptime(updated["lejarat"], "%Y-%m-%d").date()
-                            else:
-                                updated["_lej_dt"] = None
-                        except Exception:
-                            updated["_lej_dt"] = None
-
-                        # parse felulvizsgalatok
-                        fv_list_raw = updated.get("felulvizsgalatok")
-                        fv_pairs: List[tuple] = []
-                        try:
-                            if fv_list_raw:
-                                if isinstance(fv_list_raw, str):
-                                    parsed = json.loads(fv_list_raw)
-                                else:
-                                    parsed = fv_list_raw
-                                if isinstance(parsed, list):
-                                    for it in parsed:
-                                        if isinstance(it, dict):
-                                            dt = None
-                                            try:
-                                                dt = datetime.strptime(it.get("date"), "%Y-%m-%d").date()
-                                            except Exception:
-                                                try:
-                                                    dt = datetime.fromisoformat(it.get("date")).date()
-                                                except Exception:
-                                                    dt = None
-                                            note = it.get("note") or ""
-                                            if dt:
-                                                fv_pairs.append((dt, note))
-                        except Exception:
-                            pass
-                        if not fv_pairs:
-                            try:
-                                if updated.get("felulvizsgalat_date"):
-                                    ddt = datetime.strptime(updated["felulvizsgalat_date"], "%Y-%m-%d").date()
-                                    fv_pairs.append((ddt, ""))
-                            except Exception:
-                                pass
-                        try:
-                            fv_nap = int(updated.get("felulvizsgalat_nap", 0) or 0)
-                        except Exception:
-                            fv_nap = 0
-                        if fv_nap > 0 and updated.get("_lej_dt"):
-                            try:
-                                computed = updated["_lej_dt"] - timedelta(days=fv_nap)
-                                fv_pairs.append((computed, f"{fv_nap} nappal a lejárat előtt (számított)"))
-                            except Exception:
-                                pass
-                        unique = {}
-                        for dt, note in fv_pairs:
-                            key = dt.isoformat()
-                            if key not in unique:
-                                unique[key] = {"date": dt, "note": note}
-                        fv_list_sorted = [ (v["date"], v["note"]) for k, v in sorted(unique.items(), key=lambda kv: kv[0]) ]
-                        updated["_fv_list"] = fv_list_sorted
-                        try:
-                            today = date.today()
-                            upcoming = [d for d, n in fv_list_sorted if d and d >= today]
-                            if upcoming:
-                                updated["_next_fv"] = min(upcoming)
-                            else:
-                                updated["_next_fv"] = fv_list_sorted[0][0] if fv_list_sorted else None
-                        except Exception:
-                            updated["_next_fv"] = fv_list_sorted[0][0] if fv_list_sorted else None
-                    else:
-                        self.refresh_data(incremental=False)
-                except Exception:
-                    self.refresh_data(incremental=False)
+                self.refresh_data(incremental=False)
                 self.refresh_table()
-            except sqlite3.OperationalError:
-                error(self, "Hiba", "Az adatbázis foglalt. Módosítás sikertelen.")
+            except sqlite3.DatabaseError as exc:
+                logger.exception("Permit update failed")
+                error(self, "Hiba", f"Az engedély módosítása sikertelen: {exc}")
+                self._retry_permit_save(dlg, eng["id"], updating=True)
+
+    def _persist_permit(self, data: Dict[str, Any], entity_id: str, now: str, updating: bool = False) -> None:
+        columns = (
+            "telephely_id", "engedely_nev", "kategoria", "kiado_hatosag",
+            "hatarozatszam", "modosito_hat", "letrejott", "hatarozatlan",
+            "lejarat", "hataly_tipus", "felulvizsgalat_nap", "felulvizsgalat_date",
+            "felulvizsgalatok", "megjegyzes", "hulladek_nv_elokez",
+            "hulladek_v_elokez", "hulladek_nv_gyujt", "hulladek_v_gyujt", "last_modified",
+        )
+        values = dict(data)
+        values["felulvizsgalatok"] = json.dumps(data.get("felulvizsgalatok", []), ensure_ascii=False)
+        values["last_modified"] = now
+        parameters = [values.get(column) for column in columns]
+        with self.db.get_connection() as conn:
+            if updating:
+                assignments = ", ".join(f"{column}=?" for column in columns)
+                cursor = conn.execute(
+                    f"UPDATE engedelyek SET {assignments} WHERE id=? AND COALESCE(deleted, 0)=0",
+                    (*parameters, entity_id),
+                )
+                if cursor.rowcount != 1:
+                    raise sqlite3.IntegrityError("Az engedélyt időközben törölték; a módosítás nem menthető.")
+            else:
+                names = ", ".join(("id", *columns))
+                placeholders = ", ".join("?" for _ in range(len(columns) + 1))
+                conn.execute(
+                    f"INSERT INTO engedelyek ({names}) VALUES ({placeholders})",
+                    (entity_id, *parameters),
+                )
+
+    def _save_dialog_attachments(self, dialog: EngedelyDialog, entity_id: str) -> None:
+        while True:
+            try:
+                dialog.save_attachments(entity_id)
+                break
+            except OSError as exc:
+                logger.exception("Permit saved, but attachment changes failed")
+                answer = QMessageBox.warning(
+                    self, "Csatolmányok mentési hibája",
+                    f"Az engedély adatai mentve, de a csatolmányok módosítása nem teljes.\n{exc}\n\n"
+                    f"A még át nem helyezett fájlok itt maradtak: {dialog._staging_dir}\n"
+                    "Újrapróbálkozás nélkül a csatolmányokat kézzel kell rendezni.",
+                    QMessageBox.Retry | QMessageBox.Cancel, QMessageBox.Retry,
+                )
+                if answer != QMessageBox.Retry:
+                    break
+        self._attachments_cache.pop(entity_id, None)
+
+    def _retry_permit_save(self, dialog: EngedelyDialog, entity_id: str, updating: bool = False) -> None:
+        # Reuse the same form and staged files, rather than discarding input on a DB error.
+        while dialog.exec() == QDialog.Accepted:
+            try:
+                self._persist_permit(dialog.get_data(), entity_id, datetime.utcnow().isoformat(), updating)
+            except sqlite3.DatabaseError as exc:
+                logger.exception("Permit save retry failed")
+                error(self, "Mentési hiba", f"Az adatok nem kerültek mentésre: {exc}")
+                continue
+            self._save_dialog_attachments(dialog, entity_id)
+            self._safe_log("engedely_update" if updating else "engedely_insert")
+            self.refresh_data(incremental=False)
+            self.refresh_table()
+            break
 
     def del_eng(self, eng: Dict[str, Any]) -> None:
         if confirm(self, "Törlés", "Véglegesen törli ezt az engedélyt?"):
