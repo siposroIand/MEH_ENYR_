@@ -1,902 +1,563 @@
 from __future__ import annotations
 
-from typing import Optional, List, Dict, Any
-from pathlib import Path
-from datetime import datetime, date
+from datetime import date
 import logging
+from pathlib import Path
 import re
+import sqlite3
 
+from PySide6.QtCore import Qt, QStandardPaths
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
     QDateEdit, QListWidget, QListWidgetItem, QPushButton, QLineEdit,
-    QFileDialog, QMessageBox, QWidget, QStackedWidget, QFormLayout, QGroupBox,
-    QSplitter, QFrame, QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit
+    QFileDialog, QMessageBox, QWidget, QStackedWidget, QFormLayout,
+    QSplitter, QFrame, QTableWidget, QTableWidgetItem, QHeaderView,
+    QTextEdit, QInputDialog, QScrollArea, QAbstractItemView,
 )
-from PySide6.QtCore import Qt
+
+from config.app_config import APP_NAME
+from core.report_data import GROUPS, VALIDITY_STATES, UNKNOWN, build_report_groups, parse_date
+from core.report_templates import ReportTemplateStore, validate_options
+from exporters.report_builder_exporter import ALL_COLUMNS, ALIASES, export_report, prepare_report_groups
 
 logger = logging.getLogger(__name__)
-
-# ====================================================================
-# IMPORT A EGYSÉGES EXPORTERBŐL (EZ A REFAC)
-# ====================================================================
-def _import_exporters():
-    try:
-        from exporters.report_builder_exporter import export_report, ALL_COLUMNS
-    except Exception:
-        export_report = None
-        ALL_COLUMNS = [
-            ("telephely", "Telephely"),
-            ("kategoria", "Engedélytípus"),
-            ("engedely_nev", "Tárgy"),
-            ("kiado_hatosag", "Kiadó hatóság"),
-            ("hatarozatszam", "Határozat száma"),
-            ("lejarat", "Hatálya"),
-        ]
-    return export_report, ALL_COLUMNS
+DEFAULT_COLUMNS = ["telephely", "kategoria", "engedely_nev", "hatarozatszam", "lejarat"]
+PREVIEW_LIMIT = 8
+STORE_ERRORS = (OSError, sqlite3.Error, ValueError)
 
 
-_DEFAULT_COLUMN_KEYS = [
-    "telephely", "kategoria", "engedely_nev", "hatarozatszam", "lejarat"
-]
-
-_COLUMN_KEY_NORMALIZATION = {
-    "felulvizsgalat_date": "felulvizsgalat",
-    "felulvizsgalat": "felulvizsgalat",
-}
-
-
-def _parse_iso_date(value) -> Optional[date]:
-    if not value:
-        return None
-    if isinstance(value, date):
-        return value
-    try:
-        if "T" in value:
-            return datetime.fromisoformat(value).date()
-        return datetime.strptime(value, "%Y-%m-%d").date()
-    except Exception:
-        return None
-
-
-def _safe_filename(s: str) -> str:
-    if not s:
-        return "unknown"
-    return re.sub(r"[^A-Za-z0-9_\-\.]", "_", s).strip("_")
-
-
-def _compute_group_label(groups_dict: Dict[str, List[Any]], group_by_key: Optional[str], opts: Dict[str, Any], tp_map: Dict[Any, str]) -> str:
-    if not group_by_key:
-        return ""
-
-    if len(groups_dict) == 1:
-        only = next(iter(groups_dict.keys()))
-        if group_by_key in ("lejarat_month", "lejarat"):
-            try:
-                y, m = only.split("-")
-                return f" - ({y}/{m})"
-            except Exception:
-                return f" - ({only})"
-        if group_by_key == "lejarat_year":
-            return f" - ({only})"
-        if group_by_key == "kategoria":
-            return f" - ({only})"
-        return f" - ({only})"
-
-    tp_ids = opts.get("telephely_ids") or []
-    if group_by_key == "telephely" and len(tp_ids) == 1:
-        return f" - ({tp_map.get(tp_ids[0], '')})"
-
-    sel_cats = opts.get("selected_categories") or []
-    if group_by_key == "kategoria" and len(sel_cats) == 1:
-        return f" - ({sel_cats[0]})"
-
-    sel_items = opts.get("selected_items") or []
-    if sel_items:
-        if group_by_key == "telephely":
-            tp_set = {it.get("telephely_id") for it in sel_items if it.get("telephely_id") is not None}
-            if len(tp_set) == 1:
-                tid = next(iter(tp_set))
-                return f" - ({tp_map.get(tid, '')})"
-        if group_by_key in ("lejarat_month", "lejarat"):
-            ym_set = set()
-            for it in sel_items:
-                le = _parse_iso_date(it.get("lejarat"))
-                if le:
-                    ym_set.add(f"{le.year}-{le.month:02d}")
-            if len(ym_set) == 1:
-                only = next(iter(ym_set))
-                y, m = only.split("-")
-                return f" - ({y}/{m})"
-        if group_by_key == "lejarat_year":
-            y_set = set()
-            for it in sel_items:
-                le = _parse_iso_date(it.get("lejarat"))
-                if le:
-                    y_set.add(str(le.year))
-            if len(y_set) == 1:
-                return f" - ({next(iter(y_set))})"
-
-    df = opts.get("date_filter") or {}
-    if df.get("enabled"):
-        fr = df.get("from"); to = df.get("to")
-        if fr and to:
-            if group_by_key in ("lejarat_month", "lejarat") and fr.year == to.year and fr.month == to.month:
-                return f" - ({fr.year}/{fr.month:02d})"
-            if group_by_key == "lejarat_year" and fr.year == to.year:
-                return f" - ({fr.year})"
-
-    return ""
+def _safe_filename(value):
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .") or "kimutatas"
 
 
 class ReportBuilderDialog(QDialog):
-    """
-    Improved UI: wizard-like step indicator + live preview (table) on the right.
-    The logo_path is provided through the constructor (initial["logo_path"]) and there is
-    no file-browse control in the dialog by design.
-    """
-    def __init__(
-        self,
-        parent=None,
-        data: Optional[Dict[str, List[Dict[str, Any]]]] = None,
-        telephelyek: Optional[List[Dict[str, Any]]] = None,
-        logo_path: Optional[str] = None,
-        initial: Optional[Dict[str, Any]] = None,
-    ):
+    def __init__(self, parent=None, data=None, telephelyek=None, logo_path=None,
+                 initial=None, template_store=None):
         super().__init__(parent)
-        self.setWindowTitle("Kimutatás készítő")
-        self.resize(1100, 760)
-
+        self.setWindowTitle("Kimutatáskészítő")
+        self.resize(1150, 760)
         self.data = data or {"engedelyek": []}
         self.telephelyek = telephelyek or []
-        self.initial = initial or {}
-        if logo_path:
-            # keep logo path provided externally; no browsing in the UI
-            self.initial.setdefault("logo_path", logo_path)
+        self.initial = dict(initial or {})
+        self.logo_path = logo_path or self.initial.get("logo_path") or ""
+        root = Path(QStandardPaths.writableLocation(QStandardPaths.GenericDataLocation)) / APP_NAME
+        self.template_store = template_store or ReportTemplateStore(root / "report_templates.sqlite3")
+        self._updating = True
+        self._prepared = []
+        self._preview_error = ""
 
-        # main layout: left wizard stack + right preview
-        main = QHBoxLayout(self)
+        layout = QVBoxLayout(self)
+        template_row = QHBoxLayout()
+        template_row.addWidget(QLabel("Mentett sablon:"))
+        self.template_combo = QComboBox()
+        self.template_combo.setMinimumContentsLength(18)
+        template_row.addWidget(self.template_combo, 1)
+        self.btn_template_load = QPushButton("Betöltés")
+        self.btn_template_save = QPushButton("Mentés sablonként…")
+        self.btn_template_delete = QPushButton("Törlés")
+        for button in (self.btn_template_load, self.btn_template_save, self.btn_template_delete):
+            template_row.addWidget(button)
+        layout.addLayout(template_row)
+        self.template_status = QLabel("")
+        self.template_status.setWordWrap(True)
+        layout.addWidget(self.template_status)
 
-        # left: stacked wizard with step header
-        left_frame = QFrame()
-        left_layout = QVBoxLayout(left_frame)
-
-        # step header
-        self.step_label = QLabel("")
-        self.step_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        left = QFrame()
+        left_layout = QVBoxLayout(left)
+        self.step_label = QLabel()
+        self.step_label.setStyleSheet("font-weight: bold")
         left_layout.addWidget(self.step_label)
-
-        # stacked pages
         self.stack = QStackedWidget()
+        for page in (self._page_basic(), self._page_filters(), self._page_columns(), self._page_output()):
+            self.stack.addWidget(page)
         left_layout.addWidget(self.stack)
-
-        # add pages
-        self.stack.addWidget(self._page_basic())
-        self.stack.addWidget(self._page_filters())
-        self.stack.addWidget(self._page_columns())
-        self.stack.addWidget(self._page_output())
-
-        # nav buttons (at bottom of left)
         nav = QHBoxLayout()
         self.btn_prev = QPushButton("← Előző")
         self.btn_next = QPushButton("Következő →")
         self.btn_finish = QPushButton("Exportálás")
         self.btn_cancel = QPushButton("Mégse")
-        nav.addWidget(self.btn_prev)
-        nav.addStretch()
-        nav.addWidget(self.btn_cancel)
-        nav.addWidget(self.btn_next)
-        nav.addWidget(self.btn_finish)
+        for button in (self.btn_prev, self.btn_cancel, self.btn_next, self.btn_finish):
+            nav.addWidget(button)
         left_layout.addLayout(nav)
 
-        # right: preview + summary area
-        right_frame = QFrame()
-        right_layout = QVBoxLayout(right_frame)
-
-        preview_label = QLabel("Előnézet (max 8 sor)")
-        preview_label.setStyleSheet("font-weight: bold;")
-        right_layout.addWidget(preview_label)
-
-        self.preview_table = QTableWidget(0, 0)
-        self.preview_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.preview_table.verticalHeader().setVisible(False)
+        right = QFrame()
+        right_layout = QVBoxLayout(right)
+        self.preview_label = QLabel()
+        self.preview_label.setWordWrap(True)
+        right_layout.addWidget(self.preview_label)
+        self.preview_group = QComboBox()
+        self.preview_group.setToolTip("Az exportban külön munkalapra / oldalra kerülő csoport.")
+        right_layout.addWidget(self.preview_group)
+        self.preview_table = QTableWidget()
+        self.preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.preview_table.setWordWrap(True)
         self.preview_table.setAlternatingRowColors(True)
-        header = self.preview_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setStretchLastSection(True)
-        right_layout.addWidget(self.preview_table, stretch=1)
-
-        # quick summary box
+        self.preview_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        right_layout.addWidget(self.preview_table, 1)
         self.summary_box = QTextEdit()
         self.summary_box.setReadOnly(True)
-        self.summary_box.setFixedHeight(120)
-        right_layout.addWidget(QLabel("Részletes összefoglaló"))
+        self.summary_box.setMaximumHeight(160)
         right_layout.addWidget(self.summary_box)
-
-        # splitter to allow user resize left/right
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_frame)
-        splitter.addWidget(right_frame)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([700, 400])
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([560, 590])
+        layout.addWidget(splitter, 1)
 
-        main.addWidget(splitter)
-
-        # connections
-        self.btn_prev.clicked.connect(self._prev)
-        self.btn_next.clicked.connect(self._next)
-        self.btn_finish.clicked.connect(self.accept)
-        self.btn_cancel.clicked.connect(self.reject)
-
-        # wire internal updates
-        # many controls are created in pages; connect generically using method that re-connects after creation
-        self._connect_dynamic_signals()
-
-        # defaults
-        self.chk_logo.setChecked(True)
-
-        self._update_step_label()
-        self._update_preview_and_summary()
-
-    def _connect_dynamic_signals(self):
-        # called at the end of __init__ and can be reused if pages rebuilt
-        try:
-            self.tp_list.itemChanged.connect(self._on_controls_changed)
-            self.category_list.itemChanged.connect(self._on_controls_changed)
-            self.chk_include_arch.stateChanged.connect(self._on_controls_changed)
-            self.chk_date_filter.stateChanged.connect(self._on_date_filter_toggled)
-            self.date_from.dateChanged.connect(self._on_controls_changed)
-            self.date_to.dateChanged.connect(self._on_controls_changed)
-            self.cmb_group.currentIndexChanged.connect(self._on_controls_changed)
-            self.columns_list.itemChanged.connect(self._on_controls_changed)
-            # selection change used for move up/down buttons
-            self.columns_list.currentRowChanged.connect(self._on_controls_changed)
-        except Exception:
-            pass
-
-    def _on_controls_changed(self, *a):
-        # refresh preview, summary and preview count label
-        self._update_preview_and_summary()
-        self._update_nav_state()
+        self._connect_signals()
+        self._apply_options(self.initial)
+        self._refresh_templates()
 
     def _page_basic(self):
-        w = QWidget()
-        v = QVBoxLayout(w)
-
-        form = QFormLayout()
-
-        # Title only (no subtitle per request)
-        self.doc_title = QLineEdit(
-            self.initial.get("title", f"Kimutatás {date.today().isoformat()}")
-        )
-
-        # context label under title
-        self.lbl_context = QLabel("")
-        self.lbl_context.setStyleSheet("color: gray; font-size: 11px;")
-        self.lbl_context.setWordWrap(True)
-
+        page = QWidget()
+        form = QFormLayout(page)
+        self.doc_title = QLineEdit(f"Kimutatás {date.today().isoformat()}")
         self.cmb_format = QComboBox()
-        self.cmb_format.addItems(["PDF", "Excel (XLSX)"])
-        self.cmb_format.currentIndexChanged.connect(self._on_controls_changed)
-
+        self.cmb_format.addItem("PDF", "PDF")
+        self.cmb_format.addItem("Excel (XLSX)", "XLSX")
         self.cmb_group = QComboBox()
-        self.cmb_group.addItems([
-            "Nincs (Összes)",
-            "Telephelyenként",
-            "Engedélytípusonként",
-            "Kiadó hatóság szerint",
-            "Lejárat szerint (Év-Hónap)"
-            
-        ])
-        self.cmb_group.currentIndexChanged.connect(self._on_controls_changed)
-
+        for key, label in GROUPS:
+            self.cmb_group.addItem(label, key)
         self.cmb_file_mode = QComboBox()
-        self.cmb_file_mode.addItems([
-            "Minden egy fájlban",
-            "Csoportonként külön fájl",
-        ])
+        self.cmb_file_mode.addItems(["Minden egy fájlban", "Csoportonként külön fájl"])
+        form.addRow("Cím:", self.doc_title)
+        form.addRow("Formátum:", self.cmb_format)
+        form.addRow("Csoportosítás:", self.cmb_group)
+        form.addRow("Struktúra:", self.cmb_file_mode)
+        note = QLabel("Csoporton belül engedélytípus szerint rendezve. "
+                      "Excelben csoportonként munkalap, PDF-ben új oldal készül.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        return page
 
-        form.addRow(QLabel("Cím:"), self.doc_title)
-        form.addRow(QLabel(""), self.lbl_context)
-        form.addRow(QLabel("Kiterjesztés:"), self.cmb_format)
-        form.addRow(QLabel("Rendezési szempont:"), self.cmb_group)
-        form.addRow(QLabel("Struktúra:"), self.cmb_file_mode)
+    @staticmethod
+    def _add_check_item(widget, label, value, checked=True):
+        item = QListWidgetItem(str(label))
+        item.setData(Qt.UserRole, value)
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        widget.addItem(item)
 
-        box = QGroupBox("Dokumentum beállítások")
-        box.setLayout(form)
-
-        note = QLabel("")
-        note.setStyleSheet("color: gray; font-size: 11px;")
-        v.addWidget(box)
-        v.addWidget(note)
-        v.addStretch()
-        return w
+    def _filter_list(self, layout, title, values):
+        all_check = QCheckBox(f"{title}: mindegyik")
+        all_check.setChecked(True)
+        widget = QListWidget()
+        widget.setMaximumHeight(95)
+        widget.setSelectionMode(QAbstractItemView.NoSelection)
+        for value, label in values:
+            self._add_check_item(widget, label, value)
+        layout.addWidget(all_check)
+        layout.addWidget(widget)
+        row = QHBoxLayout()
+        for label, checked in (("Összes kijelölése", True), ("Kijelölés törlése", False)):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _, w=widget, a=all_check, c=checked: self._select_filter(w, a, c))
+            row.addWidget(button)
+        layout.addLayout(row)
+        all_check.toggled.connect(lambda enabled: widget.setEnabled(not enabled))
+        widget.setEnabled(False)
+        return all_check, widget
 
     def _page_filters(self):
-        w = QWidget()
-        v = QVBoxLayout(w)
-
-        top_row = QHBoxLayout()
+        content = QWidget()
+        layout = QVBoxLayout(content)
         self.chk_include_arch = QCheckBox("Archivált tételek is")
-        top_row.addWidget(self.chk_include_arch)
-        top_row.addStretch()
-        v.addLayout(top_row)
-
-        # telephelyek + select all/none
-        v.addWidget(QLabel("Telephelyek (válassz legalább egyet vagy mindet):"))
-        tp_row = QHBoxLayout()
-        self.tp_list = QListWidget()
-        self.tp_list.setSelectionMode(QListWidget.NoSelection)
-        for t in self.telephelyek:
-            it = QListWidgetItem(t.get("nev", "Ismeretlen"))
-            it.setData(Qt.UserRole, t.get("id"))
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-            it.setCheckState(Qt.Unchecked)
-            self.tp_list.addItem(it)
-        tp_btns = QVBoxLayout()
-        self.btn_tp_select_all = QPushButton("Összes kijelölése")
-        self.btn_tp_select_none = QPushButton("Kijelölés törlése")
-        tp_btns.addWidget(self.btn_tp_select_all)
-        tp_btns.addWidget(self.btn_tp_select_none)
-        tp_btns.addStretch()
-        tp_row.addWidget(self.tp_list)
-        tp_row.addLayout(tp_btns)
-        v.addLayout(tp_row)
-
-        self.btn_tp_select_all.clicked.connect(self._select_all_telephelyes)
-        self.btn_tp_select_none.clicked.connect(self._select_none_telephelyes)
-
-        # kategóriák (engedélytípusok) + select all/none
-        v.addWidget(QLabel("Engedély-kategóriák:"))
-        cat_row = QHBoxLayout()
-        self.category_list = QListWidget()
-        self.category_list.setSelectionMode(QListWidget.NoSelection)
-        cats = sorted({(e.get("kategoria") or "Ismeretlen") for e in self.data.get("engedelyek", [])})
-        for c in cats:
-            it = QListWidgetItem(c)
-            it.setData(Qt.UserRole, c)
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-            it.setCheckState(Qt.Checked)
-            self.category_list.addItem(it)
-        cat_btns = QVBoxLayout()
-        self.btn_cat_select_all = QPushButton("Összes kijelölése")
-        self.btn_cat_select_none = QPushButton("Kijelölés törlése")
-        cat_btns.addWidget(self.btn_cat_select_all)
-        cat_btns.addWidget(self.btn_cat_select_none)
-        cat_btns.addStretch()
-        cat_row.addWidget(self.category_list)
-        cat_row.addLayout(cat_btns)
-        v.addLayout(cat_row)
-
-        self.btn_cat_select_all.clicked.connect(self._select_all_categories)
-        self.btn_cat_select_none.clicked.connect(self._select_none_categories)
-
-        # dátum szűrés: bekapcsolható
-        date_box = QGroupBox("Lejárat dátum szűrése")
-        date_layout = QHBoxLayout()
-        self.chk_date_filter = QCheckBox("Szűrés dátumtartomány szerint")
-        self.date_from = QDateEdit()
-        self.date_from.setCalendarPopup(True)
-        self.date_from.setDisplayFormat("yyyy-MM-dd")
-        self.date_to = QDateEdit()
-        self.date_to.setCalendarPopup(True)
-        self.date_to.setDisplayFormat("yyyy-MM-dd")
-
-        self.date_from.setDate(date.today().replace(day=1))
-        self.date_to.setDate(date.today())
-        self.date_from.setEnabled(False)
-        self.date_to.setEnabled(False)
-
-        date_layout.addWidget(self.chk_date_filter)
-        date_layout.addWidget(QLabel("Dátumtól:"))
-        date_layout.addWidget(self.date_from)
-        date_layout.addWidget(QLabel("Dátumig:"))
-        date_layout.addWidget(self.date_to)
-        date_box.setLayout(date_layout)
-        v.addWidget(date_box)
-
-        # preview count
-        self.lbl_preview_count = QLabel("")
-        v.addWidget(self.lbl_preview_count)
-
-        v.addStretch()
-        return w
+        layout.addWidget(self.chk_include_arch)
+        self.chk_all_sites, self.tp_list = self._filter_list(
+            layout, "Telephelyek", [(t["id"], t.get("nev") or UNKNOWN) for t in self.telephelyek])
+        permits = self.data.get("engedelyek", [])
+        categories = sorted({e.get("kategoria") or UNKNOWN for e in permits}, key=str.casefold)
+        self.chk_all_categories, self.category_list = self._filter_list(
+            layout, "Engedélytípusok", [(c, c) for c in categories])
+        authorities = sorted({e.get("kiado_hatosag") or UNKNOWN for e in permits}, key=str.casefold)
+        self.chk_all_authorities, self.authority_list = self._filter_list(
+            layout, "Kiadó hatóságok", [(a, a) for a in authorities])
+        form = QFormLayout()
+        self.text_filter = QLineEdit()
+        self.text_filter.setPlaceholderText("Tárgy, határozatszám, hatóság, megjegyzés, telephely…")
+        self.validity_filter = QComboBox()
+        for key, label in VALIDITY_STATES:
+            self.validity_filter.addItem(label, key)
+        form.addRow("Szövegrészlet:", self.text_filter)
+        form.addRow("Érvényesség:", self.validity_filter)
+        layout.addLayout(form)
+        self.chk_date_filter = QCheckBox("Lejárat szűrése dátumtartomány szerint (határokkal együtt)")
+        layout.addWidget(self.chk_date_filter)
+        dates = QHBoxLayout()
+        self.date_from = QDateEdit(date.today().replace(day=1))
+        self.date_to = QDateEdit(date.today())
+        for widget in (self.date_from, self.date_to):
+            widget.setCalendarPopup(True)
+            widget.setDisplayFormat("yyyy-MM-dd")
+            widget.setEnabled(False)
+        dates.addWidget(QLabel("Dátumtól:"))
+        dates.addWidget(self.date_from)
+        dates.addWidget(QLabel("Dátumig:"))
+        dates.addWidget(self.date_to)
+        layout.addLayout(dates)
+        self.lbl_preview_count = QLabel()
+        layout.addWidget(self.lbl_preview_count)
+        note = QLabel("A „mindegyik” kikapcsolása után csak a bejelölt értékek szerepelnek. "
+                      "Üres kijelölés: nincs találat. Törölt tételek soha nem kerülnek a kimutatásba.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        return scroll
 
     def _page_columns(self):
-        w = QWidget()
-        v = QVBoxLayout(w)
-
-        _, ALL_COLUMNS = _import_exporters()
-
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        label = QLabel("Oszlopok és sorrend: húzza a sorokat, vagy használja a Fel/Le gombokat. "
+                       "A kiválasztott üres oszlopok is megmaradnak.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
         self.columns_list = QListWidget()
-        # allow drag & drop reordering now so user can change column order
-        self.columns_list.setDragDropMode(QListWidget.InternalMove)
-        # allow selection so up/down buttons work
-        self.columns_list.setSelectionMode(QListWidget.SingleSelection)
-
-        # store mapping key->item for easy lookup (we will respect visual order)
-        self._col_items: Dict[str, QListWidgetItem] = {}
-
+        self.columns_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.columns_list.setDefaultDropAction(Qt.MoveAction)
+        self.columns_list.setSelectionMode(QAbstractItemView.SingleSelection)
         for key, label in ALL_COLUMNS:
-            it = QListWidgetItem(label)
-            it.setData(Qt.UserRole, key)
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-            it.setCheckState(Qt.Checked if key in _DEFAULT_COLUMN_KEYS else Qt.Unchecked)
-            self.columns_list.addItem(it)
-            self._col_items[key] = it
-
-        # controls: select all/none and move up/down
-        btn_row = QHBoxLayout()
-        left_btns = QHBoxLayout()
+            self._add_check_item(self.columns_list, label, key, key in DEFAULT_COLUMNS)
+        layout.addWidget(self.columns_list)
+        row = QHBoxLayout()
         self.btn_select_all = QPushButton("Összes kijelölése")
-        self.btn_select_none = QPushButton("Mindet töröl")
-        left_btns.addWidget(self.btn_select_all)
-        left_btns.addWidget(self.btn_select_none)
-        btn_row.addLayout(left_btns)
-
-        right_btns = QVBoxLayout()
+        self.btn_select_none = QPushButton("Kijelölés törlése")
         self.btn_move_up = QPushButton("Fel ↑")
         self.btn_move_down = QPushButton("Le ↓")
-        right_btns.addWidget(self.btn_move_up)
-        right_btns.addWidget(self.btn_move_down)
-        right_btns.addStretch()
-        btn_row.addLayout(right_btns)
-        btn_row.addStretch()
-
-        self.btn_select_all.clicked.connect(self._select_all_columns)
-        self.btn_select_none.clicked.connect(self._select_no_columns)
-        self.btn_move_up.clicked.connect(self._move_column_up)
-        self.btn_move_down.clicked.connect(self._move_column_down)
-
-        v.addWidget(QLabel("Oszlopok kiválasztása és sorrend (húzd vagy használd a Fel/Le gombokat)"))
-        v.addLayout(btn_row)
-        v.addWidget(self.columns_list)
-        v.addStretch()
-        return w
+        for button in (self.btn_select_all, self.btn_select_none, self.btn_move_up, self.btn_move_down):
+            row.addWidget(button)
+        layout.addLayout(row)
+        return page
 
     def _page_output(self):
-        w = QWidget()
-        v = QVBoxLayout(w)
+        page = QWidget()
+        form = QFormLayout(page)
+        self.filename_hint = QLineEdit(f"kimutatas_{date.today():%Y%m%d}")
+        self.chk_logo = QCheckBox("Logó használata (PDF)")
+        self.chk_logo.setChecked(True)
+        form.addRow("Fájlnév:", self.filename_hint)
+        form.addRow(self.chk_logo)
+        note = QLabel("Az előnézet legfeljebb 8 sort mutat csoportonként. "
+                      "Az export minden szűrésnek megfelelő sort tartalmaz.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        return page
 
-        self.filename_hint = QLineEdit(
-            self.initial.get(
-                "filename_hint",
-                f"kimutatas_{date.today().strftime('%Y%m%d')}"
-            )
-        )
+    def _connect_signals(self):
+        for widget in (self.doc_title, self.filename_hint, self.text_filter):
+            widget.textChanged.connect(self._on_controls_changed)
+        for widget in (self.cmb_format, self.cmb_group, self.cmb_file_mode, self.validity_filter):
+            widget.currentIndexChanged.connect(self._on_controls_changed)
+        for widget in (self.chk_include_arch, self.chk_logo, self.chk_all_sites,
+                       self.chk_all_categories, self.chk_all_authorities):
+            widget.toggled.connect(self._on_controls_changed)
+        for widget in (self.tp_list, self.category_list, self.authority_list, self.columns_list):
+            widget.itemChanged.connect(self._on_controls_changed)
+        self.columns_list.model().rowsMoved.connect(self._on_controls_changed)
+        self.columns_list.currentRowChanged.connect(self._update_nav_state)
+        self.chk_date_filter.toggled.connect(self._on_date_filter_toggled)
+        self.date_from.dateChanged.connect(self._on_controls_changed)
+        self.date_to.dateChanged.connect(self._on_controls_changed)
+        self.btn_select_all.clicked.connect(lambda: self._select_columns(True))
+        self.btn_select_none.clicked.connect(lambda: self._select_columns(False))
+        self.btn_move_up.clicked.connect(self._move_column_up)
+        self.btn_move_down.clicked.connect(self._move_column_down)
+        self.btn_prev.clicked.connect(lambda: self._navigate(-1))
+        self.btn_next.clicked.connect(lambda: self._navigate(1))
+        self.btn_finish.clicked.connect(self.accept)
+        self.btn_cancel.clicked.connect(self.reject)
+        self.preview_group.currentIndexChanged.connect(self._render_preview)
+        self.btn_template_save.clicked.connect(self._save_template)
+        self.btn_template_load.clicked.connect(self._load_template)
+        self.btn_template_delete.clicked.connect(self._delete_template)
 
-        # logo checkbox only; path provided by caller
-        self.chk_logo = QCheckBox("Logo használata (PDF)")
+    @staticmethod
+    def _checked(widget):
+        return [widget.item(i).data(Qt.UserRole) for i in range(widget.count())
+                if widget.item(i).checkState() == Qt.Checked]
 
-        v.addWidget(QLabel("Fájlnév"))
-        v.addWidget(self.filename_hint)
-        v.addWidget(self.chk_logo)
-        v.addStretch()
-        return w
+    def get_options(self):
+        return {
+            "title": self.doc_title.text(), "format": self.cmb_format.currentData(),
+            "group_by": self.cmb_group.currentData(), "group_by_display": self.cmb_group.currentText(),
+            "per_group": self.cmb_file_mode.currentIndex() == 1,
+            "include_archived": self.chk_include_arch.isChecked(),
+            "site_filter_enabled": not self.chk_all_sites.isChecked(),
+            "telephely_ids": self._checked(self.tp_list) if not self.chk_all_sites.isChecked() else [],
+            "selected_categories": None if self.chk_all_categories.isChecked() else self._checked(self.category_list),
+            "selected_authorities": None if self.chk_all_authorities.isChecked() else self._checked(self.authority_list),
+            "text_filter": self.text_filter.text(), "validity_state": self.validity_filter.currentData(),
+            "columns": self._checked(self.columns_list),
+            "column_order": [self.columns_list.item(i).data(Qt.UserRole) for i in range(self.columns_list.count())],
+            "filename_hint": _safe_filename(self.filename_hint.text()),
+            "include_logo": self.chk_logo.isChecked(), "logo_path": self.logo_path,
+            "date_filter": {
+                "enabled": self.chk_date_filter.isChecked(),
+                "from": self.date_from.date().toPython(), "to": self.date_to.date().toPython(),
+            },
+        }
 
-    def _prev(self):
-        idx = max(0, self.stack.currentIndex() - 1)
-        self.stack.setCurrentIndex(idx)
-        self._update_step_label()
-        self._update_preview_and_summary()
+    def _apply_selection(self, widget, all_check, values):
+        all_check.setChecked(values is None)
+        existing = [widget.item(i).data(Qt.UserRole) for i in range(widget.count())]
+        for value in values or []:
+            if value not in existing:
+                self._add_check_item(widget, f"{value} (jelenleg nem elérhető)", value)
+        for i in range(widget.count()):
+            item = widget.item(i)
+            item.setCheckState(Qt.Checked if values is None or item.data(Qt.UserRole) in values else Qt.Unchecked)
 
-    def _next(self):
-        idx = min(self.stack.count() - 1, self.stack.currentIndex() + 1)
-        self.stack.setCurrentIndex(idx)
-        self._update_step_label()
-        self._update_preview_and_summary()
+    def _apply_options(self, options):
+        options = validate_options(options)
+        columns = [ALIASES.get(c, c) for c in options.get("columns", DEFAULT_COLUMNS)]
+        order = [ALIASES.get(c, c) for c in options.get("column_order", columns)]
+        known = dict(ALL_COLUMNS)
+        if any(c not in known for c in columns + order):
+            raise ValueError("A sablon ismeretlen oszlopot tartalmaz.")
+        order = list(dict.fromkeys(order + columns + list(known)))
+        self._updating = True
+        try:
+            self.doc_title.setText(options.get("title", f"Kimutatás {date.today().isoformat()}"))
+            self.cmb_format.setCurrentIndex(self.cmb_format.findData(options.get("format", "PDF")))
+            self.cmb_group.setCurrentIndex(self.cmb_group.findData(options.get("group_by")))
+            self.cmb_file_mode.setCurrentIndex(int(options.get("per_group", False)))
+            self.chk_include_arch.setChecked(options.get("include_archived", False))
+            sites = options.get("telephely_ids", [])
+            sites_enabled = options.get("site_filter_enabled", bool(sites))
+            self._apply_selection(self.tp_list, self.chk_all_sites, sites if sites_enabled else None)
+            self._apply_selection(self.category_list, self.chk_all_categories, options.get("selected_categories"))
+            self._apply_selection(self.authority_list, self.chk_all_authorities, options.get("selected_authorities"))
+            self.text_filter.setText(options.get("text_filter", ""))
+            self.validity_filter.setCurrentIndex(self.validity_filter.findData(options.get("validity_state", "all")))
+            df = options.get("date_filter", {})
+            self.date_from.setDate(parse_date(df.get("from")) or date.today().replace(day=1))
+            self.date_to.setDate(parse_date(df.get("to")) or date.today())
+            self.chk_date_filter.setChecked(df.get("enabled", False))
+            self.columns_list.clear()
+            for key in order:
+                self._add_check_item(self.columns_list, known[key], key, key in columns)
+            self.filename_hint.setText(options.get("filename_hint", f"kimutatas_{date.today():%Y%m%d}"))
+            self.chk_logo.setChecked(options.get("include_logo", True))
+        finally:
+            self._updating = False
+        self._on_controls_changed()
 
-    def _update_nav_state(self):
-        idx = self.stack.currentIndex()
-        self.btn_prev.setEnabled(idx > 0)
-        self.btn_next.setEnabled(idx < self.stack.count() - 1)
-        self.btn_finish.setVisible(idx == self.stack.count() - 1)
+    def _select_filter(self, widget, all_check, checked):
+        self._updating = True
+        all_check.setChecked(False)
+        for i in range(widget.count()):
+            widget.item(i).setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self._updating = False
+        self._on_controls_changed()
 
-    def _update_step_label(self):
-        titles = ["Dokumentum", "Szűrők", "Oszlopok", "Kimenet"]
-        idx = self.stack.currentIndex()
-        self.step_label.setText(f"{idx+1} / {len(titles)} — {titles[idx]}")
-
-    def _select_all_columns(self):
+    def _select_columns(self, checked):
+        self._updating = True
         for i in range(self.columns_list.count()):
-            it = self.columns_list.item(i)
-            it.setCheckState(Qt.Checked)
+            self.columns_list.item(i).setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self._updating = False
         self._on_controls_changed()
 
-    def _select_no_columns(self):
-        for i in range(self.columns_list.count()):
-            it = self.columns_list.item(i)
-            it.setCheckState(Qt.Unchecked)
+    def _move_column(self, offset):
+        index = self.columns_list.currentRow()
+        if index < 0 or not 0 <= index + offset < self.columns_list.count():
+            return
+        item = self.columns_list.takeItem(index)
+        self.columns_list.insertItem(index + offset, item)
+        self.columns_list.setCurrentRow(index + offset)
         self._on_controls_changed()
 
-    def _select_all_telephelyes(self):
-        for i in range(self.tp_list.count()):
-            it = self.tp_list.item(i)
-            it.setCheckState(Qt.Checked)
-        self._on_controls_changed()
+    def _move_column_up(self):
+        self._move_column(-1)
 
-    def _select_none_telephelyes(self):
-        for i in range(self.tp_list.count()):
-            it = self.tp_list.item(i)
-            it.setCheckState(Qt.Unchecked)
-        self._on_controls_changed()
+    def _move_column_down(self):
+        self._move_column(1)
 
-    def _select_all_categories(self):
-        for i in range(self.category_list.count()):
-            it = self.category_list.item(i)
-            it.setCheckState(Qt.Checked)
-        self._on_controls_changed()
-
-    def _select_none_categories(self):
-        for i in range(self.category_list.count()):
-            it = self.category_list.item(i)
-            it.setCheckState(Qt.Unchecked)
-        self._on_controls_changed()
-
-    def _on_date_filter_toggled(self, state: int):
-        enabled = state == Qt.Checked
+    def _on_date_filter_toggled(self, enabled):
         self.date_from.setEnabled(enabled)
         self.date_to.setEnabled(enabled)
         self._on_controls_changed()
 
-    def _move_column_up(self):
-        row = self.columns_list.currentRow()
-        if row <= 0:
-            return
-        item = self.columns_list.takeItem(row)
-        # re-insert at row-1
-        self.columns_list.insertItem(row - 1, item)
-        self.columns_list.setCurrentRow(row - 1)
-        self._on_controls_changed()
-
-    def _move_column_down(self):
-        row = self.columns_list.currentRow()
-        if row < 0 or row >= self.columns_list.count() - 1:
-            return
-        item = self.columns_list.takeItem(row)
-        self.columns_list.insertItem(row + 1, item)
-        self.columns_list.setCurrentRow(row + 1)
-        self._on_controls_changed()
-
-    def get_options(self) -> Dict[str, Any]:
-        # Respect visual order from columns_list; only include keys that are checked
-        columns = []
-        for i in range(self.columns_list.count()):
-            it = self.columns_list.item(i)
-            if it.checkState() == Qt.Checked:
-                columns.append(it.data(Qt.UserRole))
-
-        columns = [_COLUMN_KEY_NORMALIZATION.get(c, c) for c in columns]
-
-        group_map = {
-            "Telephelyenként": "telephely",
-            "Engedélytípusonként": "kategoria",
-            "Kiadó hatóság szerint": "kiado_hatosag",
-            "Lejárat szerint (Év-Hónap)": "lejarat_month",
-            "Nincs (Összes)": None
-        }
-
-        date_filter_enabled = self.chk_date_filter.isChecked()
-        date_from = None
-        date_to = None
-        if date_filter_enabled:
-            try:
-                date_from = self.date_from.date().toPython()
-                date_to = self.date_to.date().toPython()
-            except Exception:
-                date_from = None
-                date_to = None
-
-        telephely_ids = [
-            self.tp_list.item(i).data(Qt.UserRole)
-            for i in range(self.tp_list.count())
-            if self.tp_list.item(i).checkState() == Qt.Checked
-        ]
-
-        selected_categories = [
-            self.category_list.item(i).data(Qt.UserRole)
-            for i in range(self.category_list.count())
-            if self.category_list.item(i).checkState() == Qt.Checked
-        ]
-
-        # logo_path comes from initial (no browse in UI)
-        logo_path = self.initial.get("logo_path", "")
-
-        return {
-            "format": "PDF" if self.cmb_format.currentText().startswith("PDF") else "XLSX",
-            "group_by": group_map.get(self.cmb_group.currentText()),
-            "group_by_display": self.cmb_group.currentText(),
-            "per_group": self.cmb_file_mode.currentIndex() == 1,
-            "include_archived": self.chk_include_arch.isChecked(),
-            "telephely_ids": telephely_ids,
-            "columns": columns,
-            "filename_hint": _safe_filename(self.filename_hint.text() or ""),
-            "title": (self.doc_title.text() or ""),
-            # subtitle intentionally omitted
-            "include_logo": self.chk_logo.isChecked(),
-            "logo_path": (logo_path or ""),
-            "date_format": "%Y-%m-%d",
-            "date_filter": {
-                "enabled": date_filter_enabled,
-                "from": date_from,
-                "to": date_to,
-            },
-            "selected_categories": selected_categories,
-            "selected_items": [self._get_item_by_row(i) for i in range(self.category_list.count())],
-        }
-
-    def _get_item_by_row(self, idx: int) -> Dict[str, Any]:
-        # placeholder to keep compatibility; real selection inference uses selected_categories
-        return {}
-
-    def _update_preview_and_summary(self):
-        # refresh preview table and summary box based on current options
-        opts = self.get_options()
-        # compute filtered items (same logic as run_report)
-        items = list(self.data.get("engedelyek", []))
-        filtered = []
-        for e in items:
-            if not opts.get("include_archived") and e.get("archived"):
-                continue
-            tp_ids = opts.get("telephely_ids") or []
-            if tp_ids and (e.get("telephely_id") not in tp_ids):
-                continue
-            df = opts.get("date_filter") or {}
-            if df.get("enabled"):
-                lejar = _parse_iso_date(e.get("lejarat"))
-                if not lejar:
-                    continue
-                from_d = df.get("from")
-                to_d = df.get("to")
-                if from_d and lejar < from_d:
-                    continue
-                if to_d and lejar > to_d:
-                    continue
-            sel_cats = opts.get("selected_categories") or []
-            if sel_cats and (e.get("kategoria") not in sel_cats):
-                continue
-            filtered.append(e)
-
-        # update preview count label
-        self.lbl_preview_count.setText(f"Szűrésnek megfelelő tételek: {len(filtered)}")
-
-        # prepare preview table columns and rows
-        _, ALL_COLUMNS = _import_exporters()
-        key_to_label = {k: l for k, l in ALL_COLUMNS}
-        columns = opts.get("columns") or [k for k, _ in ALL_COLUMNS]
-        # prune using exporter logic is left to exporter; preview shows chosen columns in visual order
-        self.preview_table.clear()
-        cols = [key_to_label.get(k, k) for k in columns]
-        self.preview_table.setColumnCount(len(cols))
-        self.preview_table.setHorizontalHeaderLabels(cols)
-
-        # take up to 8 rows
-        preview_rows = filtered[:8]
-        self.preview_table.setRowCount(len(preview_rows))
-        tp_map = {t["id"]: t.get("nev", "Ismeretlen") for t in self.telephelyek}
-
-        for r_idx, e in enumerate(preview_rows):
-            for c_idx, key in enumerate(columns):
-                # format values similar to exporter: None -> ""
-                val = e.get(key)
-                if key == "telephely":
-                    val = tp_map.get(e.get("telephely_id"), "")
-                elif key in ("lejarat", "lejarat_display"):
-                    # show full original date (YYYY.MM.DD) in preview too
-                    if val is None:
-                        val = ""
-                    else:
-                        try:
-                            if isinstance(val, date):
-                                val = val.strftime("%Y.%m.%d")
-                            elif isinstance(val, str) and "T" in val:
-                                val = datetime.fromisoformat(val).date().strftime("%Y.%m.%d")
-                            else:
-                                val = datetime.strptime(val, "%Y-%m-%d").date().strftime("%Y.%m.%d")
-                        except Exception:
-                            val = str(val) if val is not None else ""
-                elif key == "modosito_hat" and val is not None:
-                    # convert semicolons to newlines for preview
-                    val = re.sub(r";\s*", "\n", (val if isinstance(val, str) else str(val)))
-                else:
-                    val = "" if val is None else val
-                item = QTableWidgetItem(str(val))
-                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                item.setToolTip(str(val))
-                self.preview_table.setItem(r_idx, c_idx, item)
-
-        # autosize columns but avoid exceeding width: let header be interactive but we auto-resize to contents then cap
-        self.preview_table.resizeColumnsToContents()
-        total_w = sum(self.preview_table.columnWidth(i) for i in range(self.preview_table.columnCount()))
-        available = self.preview_table.viewport().width() or 600
-        if total_w > available and self.preview_table.columnCount() > 0:
-            # scale down proportionally
-            for i in range(self.preview_table.columnCount()):
-                w = self.preview_table.columnWidth(i)
-                new_w = max(60, int(w * available / total_w))
-                self.preview_table.setColumnWidth(i, new_w)
-        # ensure last section stretches to fill
-        self.preview_table.horizontalHeader().setStretchLastSection(True)
-
-        # summary text
-        s_lines = [
-            f"Cím: {opts.get('title') or '(nincs)'}",
-            f"Kiterjesztés: {opts.get('format')}",
-            f"Rendezési szempont: {opts.get('group_by_display')}",
-            f"Struktúra: {'Csoportonként' if opts.get('per_group') else 'Egy fájl'}",
-            f"Logó használata: {'Igen' if opts.get('include_logo') else 'Nem'}",
-            f"Tételszám: {len(filtered)}"
-        ]
-        s_lines.append("Kijelölt oszlopok: " + ", ".join([c for c in columns]) if columns else "Kijelölt oszlopok: (nincs)")
-        self.summary_box.setPlainText("\n".join(s_lines))
-
-        self._update_step_label()
+    def _navigate(self, offset):
+        self.stack.setCurrentIndex(max(0, min(3, self.stack.currentIndex() + offset)))
         self._update_nav_state()
 
-    def _choose_logo(self):
-        # browsing removed as requested
-        return
+    def _update_nav_state(self, *_):
+        if self._updating:
+            return
+        index = self.stack.currentIndex()
+        self.step_label.setText(f"{index+1} / 4 — {['Dokumentum', 'Szűrők', 'Oszlopok', 'Kimenet'][index]}")
+        self.btn_prev.setEnabled(index > 0)
+        self.btn_next.setVisible(index < 3)
+        self.btn_finish.setVisible(index == 3)
+        self.btn_finish.setEnabled(not self._preview_error and any(g.rows for g in self._prepared))
+        row = self.columns_list.currentRow()
+        self.btn_move_up.setEnabled(row > 0)
+        self.btn_move_down.setEnabled(0 <= row < self.columns_list.count()-1)
 
-# ====================================================================
-# RUN_REPORT (egyesített export hívás az új exporterrel)
-# ====================================================================
-def run_report(
-    parent,
-    opts: Dict[str, Any],
-    data: Dict[str, List[Dict[str, Any]]],
-    telephelyek: List[Dict[str, Any]],
-    logo_path: Optional[str] = None,
-    attachments_dir: Optional[str] = None,
-):
-    # unchanged: delegates to exporter
-    from PySide6.QtWidgets import QMessageBox
-    export_report, _ = _import_exporters()
+    def _on_controls_changed(self, *_):
+        if not self._updating:
+            self._update_preview_and_summary()
 
-    items = list(data.get("engedelyek", []))
-    if not items:
-        QMessageBox.information(parent, "Kimutatás", "Nincs exportálható adat.")
-        return
+    def _update_preview_and_summary(self):
+        opts = self.get_options()
+        self._preview_error = ""
+        try:
+            if not opts["columns"]:
+                raise ValueError("Válasszon legalább egy oszlopot.")
+            groups = build_report_groups(self.data.get("engedelyek", []), self.telephelyek, opts)
+            self._prepared = prepare_report_groups(groups, self.telephelyek, opts["columns"], prune_empty=False)
+        except ValueError as exc:
+            self._prepared = []
+            self._preview_error = str(exc)
+        current = self.preview_group.currentText()
+        self.preview_group.blockSignals(True)
+        self.preview_group.clear()
+        self.preview_group.addItems([group.name for group in self._prepared])
+        index = self.preview_group.findText(current)
+        if index >= 0:
+            self.preview_group.setCurrentIndex(index)
+        self.preview_group.blockSignals(False)
+        count = sum(len(group.rows) for group in self._prepared)
+        self.lbl_preview_count.setText(self._preview_error or f"Szűrésnek megfelelő tételek: {count}")
+        labels = dict(ALL_COLUMNS)
+        self.summary_box.setPlainText(
+            f"Cím: {opts['title'] or '(nincs)'}\nFormátum: {opts['format']}\n"
+            f"Csoportosítás: {self.cmb_group.currentText()}\n"
+            f"Struktúra: {self.cmb_file_mode.currentText()}\n"
+            f"Oszlopok: {', '.join(labels[c] for c in opts['columns'])}\n"
+            f"Tételszám: {count}; csoportok: {len(self._prepared)}"
+        )
+        self._render_preview()
+        self._update_nav_state()
 
-    # same filtering logic as before
-    def _item_in_filters(e: Dict[str, Any]) -> bool:
-        if not opts.get("include_archived") and e.get("archived"):
-            return False
-        tp_ids = opts.get("telephely_ids") or []
-        if tp_ids and (e.get("telephely_id") not in tp_ids):
-            return False
-        df = opts.get("date_filter") or {}
-        if df.get("enabled"):
-            lejar = _parse_iso_date(e.get("lejarat"))
-            if not lejar:
-                return False
-            from_d = df.get("from")
-            to_d = df.get("to")
-            if from_d and lejar < from_d:
-                return False
-            if to_d and lejar > to_d:
-                return False
-        return True
+    def _render_preview(self, *_):
+        self.preview_table.clear()
+        index = self.preview_group.currentIndex()
+        group = self._prepared[index] if 0 <= index < len(self._prepared) else None
+        total = sum(len(g.rows) for g in self._prepared)
+        if group is None:
+            self.preview_table.setRowCount(0)
+            self.preview_table.setColumnCount(0)
+            self.preview_label.setText(self._preview_error or "Nincs a szűrésnek megfelelő tétel.")
+            return
+        rows = group.rows[:PREVIEW_LIMIT]
+        self.preview_label.setText(
+            f"Előnézet: {len(rows)} / {len(group.rows)} sor ebben a csoportban (korlát: {PREVIEW_LIMIT}). "
+            f"Teljes export: {total} sor, {len(self._prepared)} csoport. Az export minden sort tartalmaz."
+        )
+        self.preview_table.setColumnCount(len(group.columns))
+        self.preview_table.setHorizontalHeaderLabels(group.headers)
+        self.preview_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for col_index, value in enumerate(row):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(value))
+                self.preview_table.setItem(row_index, col_index, item)
+        self.preview_table.resizeColumnsToContents()
+        for i in range(self.preview_table.columnCount()):
+            self.preview_table.setColumnWidth(i, min(260, max(90, self.preview_table.columnWidth(i))))
+        self.preview_table.resizeRowsToContents()
 
-    filtered_items = [e for e in items if _item_in_filters(e)]
-    if not filtered_items:
-        QMessageBox.information(parent, "Kimutatás", "A szűrésnek nincs megfelelő tétel.")
-        return
+    def accept(self):
+        self._update_preview_and_summary()
+        if self._preview_error or not any(g.rows for g in self._prepared):
+            QMessageBox.warning(self, "Kimutatás", self._preview_error or "Nincs exportálható tétel.")
+            return
+        super().accept()
 
-    sel_cats = opts.get("selected_categories") or []
-    if sel_cats:
-        filtered_items = [e for e in filtered_items if (e.get("kategoria") or "Ismeretlen") in sel_cats]
+    def _refresh_templates(self, selected=None):
+        try:
+            names = self.template_store.names()
+        except STORE_ERRORS as exc:
+            self.template_status.setText(f"A sablonok nem olvashatók: {exc}")
+            self.btn_template_load.setEnabled(False)
+            self.btn_template_delete.setEnabled(False)
+            return
+        self.template_combo.clear()
+        self.template_combo.addItems(names)
+        if selected in names:
+            self.template_combo.setCurrentText(selected)
+        self.btn_template_load.setEnabled(bool(names))
+        self.btn_template_delete.setEnabled(bool(names))
 
-    if not filtered_items:
-        QMessageBox.information(parent, "Kimutatás", "Nincsenek kiválasztott tételek az aktuális szűrés mellett.")
-        return
+    def _save_template(self):
+        name, ok = QInputDialog.getText(self, "Sablon mentése", "Sablonnév:", text=self.template_combo.currentText())
+        if not ok:
+            return
+        name = name.strip()
+        try:
+            exists = name in self.template_store.names()
+            if exists and QMessageBox.question(self, "Sablon felülírása", f"Felülírja a(z) „{name}” sablont?",
+                                               QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+            self.template_store.save(name, self.get_options(), overwrite=exists)
+        except STORE_ERRORS as exc:
+            QMessageBox.warning(self, "Sablon mentési hiba", str(exc))
+            return
+        self.template_status.setText(f"Sablon mentve: {name}")
+        self._refresh_templates(name)
 
-    # grouping and call to exporter unchanged (exporter takes care of details)
-    fmt = opts.get("format", "PDF")
-    export_fn, _ = _import_exporters()
-    if not export_fn:
-        QMessageBox.critical(parent, "Export", "Exporter modul nem érhető el.")
-        return
+    def _load_template(self):
+        name = self.template_combo.currentText()
+        if not name:
+            return
+        try:
+            self._apply_options(self.template_store.load(name))
+        except STORE_ERRORS as exc:
+            QMessageBox.warning(self, "Sablon betöltési hiba", str(exc))
+            return
+        self.template_status.setText(f"Sablon betöltve: {name}")
 
-    # Prepare groups (same logic as prior implementation)
-    group_by = opts.get("group_by")
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    tp_map = {t["id"]: t.get("nev", "Ismeretlen") for t in telephelyek}
+    def _delete_template(self):
+        name = self.template_combo.currentText()
+        if not name or QMessageBox.question(self, "Sablon törlése", f"Törli a(z) „{name}” sablont?",
+                                           QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            self.template_store.delete(name)
+        except STORE_ERRORS as exc:
+            QMessageBox.warning(self, "Sablon törlési hiba", str(exc))
+            return
+        self.template_status.setText(f"Sablon törölve: {name}")
+        self._refresh_templates()
 
-    if group_by == "telephely":
-        for e in filtered_items:
-            groups.setdefault(tp_map.get(e.get("telephely_id"), "Ismeretlen"), []).append(e)
-    elif group_by == "kategoria":
-        for e in filtered_items:
-            groups.setdefault(e.get("kategoria") or "Ismeretlen", []).append(e)
-    elif group_by == "status":
-        today = date.today()
-        for e in filtered_items:
-            ht = (e.get("hataly_tipus") or "")
-            try:
-                ht = ht.strip().lower()
-            except Exception:
-                ht = str(ht).lower() if ht is not None else ""
-            if ht == "fixed":
-                lejar = _parse_iso_date(e.get("lejarat"))
-                key = "Aktív" if (lejar and lejar >= today) else "Lejárt"
-            else:
-                key = "Aktív"
-            groups.setdefault(key, []).append(e)
-    elif group_by == "kiado_hatosag":
-        for e in filtered_items:
-            groups.setdefault(e.get("kiado_hatosag") or "Ismeretlen", []).append(e)
-    elif group_by == "lejarat_month":
-        for e in filtered_items:
-            lejar = _parse_iso_date(e.get("lejarat"))
-            if lejar:
-                key = lejar.strftime("%Y-%m")
-            else:
-                key = "Ismeretlen"
-            groups.setdefault(key, []).append(e)
-    elif group_by == "lejarat_year":
-        for e in filtered_items:
-            lejar = _parse_iso_date(e.get("lejarat"))
-            if lejar:
-                key = str(lejar.year)
-            else:
-                key = "Ismeretlen"
-            groups.setdefault(key, []).append(e)
-    else:
-        groups["Összes"] = filtered_items
 
-    filename_hint = opts.get("filename_hint") or "kimutatas"
-    per_group = opts.get("per_group", False)
-    columns = opts.get("columns") or []
-
-    # call exporter (kept simple)
-    if fmt == "PDF":
+def run_report(parent, opts, data, telephelyek, logo_path=None, attachments_dir=None):
+    """Use exactly the same report model as the preview; report failures explicitly."""
+    try:
+        columns = opts.get("columns")
+        if not columns:
+            raise ValueError("Válasszon legalább egy oszlopot.")
+        groups = build_report_groups(data.get("engedelyek", []), telephelyek, opts)
+        if not groups:
+            QMessageBox.information(parent, "Kimutatás", "A szűrésnek nincs megfelelő tétel.")
+            return
+        # Validate formatting before opening a destination or writing any output.
+        prepare_report_groups(groups, telephelyek, columns, prune_empty=False)
+        fmt = opts.get("format", "PDF")
+        if fmt not in ("PDF", "XLSX"):
+            raise ValueError("Nem támogatott exportformátum.")
+        per_group = bool(opts.get("per_group"))
         if per_group:
-            out_dir = QFileDialog.getExistingDirectory(parent, "Mappa kiválasztása a csoportonkénti mentéshez")
-            if not out_dir:
-                return
-            try:
-                export_fn(out_dir, groups, telephelyek, columns, fmt="PDF", title=(opts.get("title") or ""), logo_path=(opts.get("logo_path")), include_waste=True, per_group=True)
-            except Exception as exc:
-                logger.exception("Export per-group PDF error: %s", exc)
-                QMessageBox.critical(parent, "Export", f"Hiba az exportálás során: {exc}")
-                return
-            QMessageBox.information(parent, "Export", "PDF fájlok elkészültek.")
-            return
+            path = QFileDialog.getExistingDirectory(parent, "Mappa a csoportonkénti mentéshez")
         else:
-            path, _ = QFileDialog.getSaveFileName(parent, "PDF mentése", f"{filename_hint}.pdf", "PDF (*.pdf)")
-            if not path:
-                return
-            try:
-                export_fn(path, groups, telephelyek, columns, fmt="PDF", title=(opts.get("title") or ""), logo_path=(opts.get("logo_path")), include_waste=True, per_group=False)
-            except Exception as exc:
-                logger.exception("PDF export hiba: %s", exc)
-                QMessageBox.critical(parent, "Export", f"Hiba a PDF mentésekor: {exc}")
-                return
-            QMessageBox.information(parent, "Export", "PDF elkészült.")
+            suffix = ".pdf" if fmt == "PDF" else ".xlsx"
+            name = _safe_filename(opts.get("filename_hint") or "kimutatas")
+            if not name.lower().endswith(suffix):
+                name += suffix
+            path, _ = QFileDialog.getSaveFileName(parent, "Kimutatás mentése", name, f"{fmt} (*{suffix})")
+            if path and not path.lower().endswith(suffix):
+                path += suffix
+        if not path:
             return
-    else:
-        if per_group:
-            out_dir = QFileDialog.getExistingDirectory(parent, "Mappa kiválasztása a csoportonkénti mentéshez")
-            if not out_dir:
-                return
-            try:
-                export_fn(out_dir, groups, telephelyek, columns, fmt="XLSX", title=(opts.get("title") or ""), include_waste=True, per_group=True)
-            except Exception as exc:
-                logger.exception("Excel per-group export hiba: %s", exc)
-                QMessageBox.critical(parent, "Export", f"Hiba az exportálás során: {exc}")
-                return
-            QMessageBox.information(parent, "Export", "Excel fájlok elkészültek.")
-            return
-        else:
-            path, _ = QFileDialog.getSaveFileName(parent, "Excel mentése", f"{filename_hint}.xlsx", "Excel (*.xlsx)")
-            if not path:
-                return
-            try:
-                export_fn(path, groups, telephelyek, columns, fmt="XLSX", title=(opts.get("title") or ""), include_waste=True, per_group=False)
-            except Exception as exc:
-                logger.exception("Excel export hiba: %s", exc)
-                QMessageBox.critical(parent, "Export", f"Hiba az Excel mentésekor: {exc}")
-                return
-            QMessageBox.information(parent, "Export", "Excel elkészült.")
-            return
+        logo = (opts.get("logo_path") or logo_path) if opts.get("include_logo", True) else None
+        export_report(path, groups, telephelyek, columns, fmt=fmt, title=opts.get("title"),
+                      logo_path=logo, per_group=per_group, prune_empty=False)
+    except Exception as exc:
+        logger.exception("Kimutatás exportálása sikertelen")
+        QMessageBox.critical(parent, "Exportálási hiba", f"A kimutatás nem készült el teljesen: {exc}")
+        return
+    count = sum(len(items) for items in groups.values())
+    QMessageBox.information(parent, "Exportálás", f"A kimutatás elkészült ({count} tétel).")

@@ -24,7 +24,7 @@ class TelephelyListDialog(QDialog):
     """
     Dialog telephelyek kezelésére.
     Konstruktor: TelephelyListDialog(db, parent=None)
-      - db: az alkalmazás Database objektuma (várja, hogy legyen get_telephelyek() és get_connection())
+      - db: helyi vagy központi adatkezelő a telephelyműveletekhez.
     """
 
     def __init__(self, db, parent=None):
@@ -69,9 +69,9 @@ class TelephelyListDialog(QDialog):
         tps: List[dict] = []
         try:
             tps = self.db.get_telephelyek()
-        except Exception:
+        except Exception as exc:
             logger.exception("get_telephelyek failed")
-            # lehetőség: üzenet a felhasználónak, de itt csak üres lista jön ha hiba.
+            QMessageBox.warning(self, "Telephelyek", f"A lista nem tölthető be: {exc}")
         for t in sorted(tps, key=lambda x: (x.get("nev") or "").lower()):
             name = t.get("nev", "Ismeretlen")
             ktj = t.get("ktj")
@@ -99,9 +99,7 @@ class TelephelyListDialog(QDialog):
         d = dlg.get_data()
         new_id = str(uuid4())
         try:
-            with self.db.get_connection() as conn:
-                conn.execute("INSERT INTO telephelyek (id, nev, ktj, cim) VALUES (?,?,?,?)",
-                             (new_id, d["nev"], d["ktj"], d["cim"]))
+            self.db.save_telephely(d, new_id)
             self._safe_log("telephely_insert")
         except Exception as e:
             logger.exception("Telephely létrehozása sikertelen: %s", e)
@@ -120,10 +118,9 @@ class TelephelyListDialog(QDialog):
         if dlg.exec() != QDialog.Accepted:
             return
         d = dlg.get_data()
+        d["revision"] = t.get("revision", "")
         try:
-            with self.db.get_connection() as conn:
-                conn.execute("UPDATE telephelyek SET nev=?, ktj=?, cim=? WHERE id=?",
-                             (d["nev"], d["ktj"], d["cim"], t["id"]))
+            self.db.save_telephely(d, t["id"], updating=True)
             self._safe_log("telephely_update")
         except Exception as e:
             logger.exception("Telephely frissítése sikertelen: %s", e)
@@ -138,25 +135,11 @@ class TelephelyListDialog(QDialog):
             QMessageBox.information(self, "Nincs kiválasztva", "Válasszon ki egy telephelyet a törléshez.")
             return
         t = sel.data(Qt.UserRole)
-        # ellenőrzés: vannak-e engedélyek a telephelyhez (nem törölt állapotban)
-        try:
-            with self.db.get_connection() as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT COUNT(1) as c FROM engedelyek WHERE telephely_id=? AND (deleted IS NULL OR deleted=0)", (t["id"],))
-                row = cur.fetchone()
-                if row and row["c"] > 0:
-                    QMessageBox.warning(self, "Nem törölhető", "A telephelyhez engedélyek tartoznak — előbb törölje vagy áthelyezze azokat.")
-                    return
-        except Exception:
-            # ha ellenőrzés nem sikerült, ne engedjük automatikusan törölni, kérjünk megerősítést
-            pass
-
         if QMessageBox.question(self, "Törlés megerősítése", f"Tényleg törli a telephelyet?\n{t.get('nev')}") != QMessageBox.Yes:
             return
 
         try:
-            with self.db.get_connection() as conn:
-                conn.execute("DELETE FROM telephelyek WHERE id=?", (t["id"],))
+            self.db.delete_telephely(t["id"], t.get("revision", ""))
             self._safe_log("telephely_delete")
         except Exception as e:
             logger.exception("Telephely törlése sikertelen: %s", e)

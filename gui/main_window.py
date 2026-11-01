@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QDialog, QDateEdit, QInputDialog, QFileDialog,
     QHeaderView, QGroupBox, QListWidget, QListWidgetItem, QTabWidget,
     QSizePolicy, QDialogButtonBox, QAbstractItemView, QToolButton,
-    QMenu, QWidgetAction, QComboBox
+    QMenu, QWidgetAction, QComboBox, QMessageBox
 )
 try:
     from PySide6.QtWidgets import QAction, QShortcut
@@ -89,7 +89,7 @@ from gui.ui_texts import (
 from gui.ui_helpers import confirm, info, warning, error
 
 from config import settings
-from utils.fs_utils import sanitize_filename, safe_copy_to_dir, validate_attachment
+from utils.fs_utils import sanitize_filename, safe_copy_to_dir, validate_attachment, attachment_write_lock
 
 logger = logging.getLogger("engedely_nyilvantarto")
 if not logger.handlers:
@@ -271,6 +271,11 @@ class BackupRestoreDialog(QDialog):
         self.btn_open.clicked.connect(self._do_open)
         self.btn_close.clicked.connect(self.accept)
 
+        if getattr(self.db, "is_remote", False):
+            self.btn_restore.setEnabled(False)
+            self.btn_restore.setToolTip("Központi módban visszaállítás csak leállított szolgáltatás mellett, a szervergépen végezhető.")
+            self.btn_open.setEnabled(False)
+            v.insertWidget(0, QLabel("A mentések a szervergép helyi backup könyvtárában találhatók."))
         self.refresh_list()
 
     def refresh_list(self):
@@ -279,6 +284,7 @@ class BackupRestoreDialog(QDialog):
             backs = self.db.list_backups()
         except Exception as e:
             logger.exception("list_backups failed: %s", e)
+            error(self, "Mentések", f"A mentések listája nem tölthető be: {e}")
             backs = []
         for p in backs:
             it = QListWidgetItem(p.name)
@@ -713,7 +719,7 @@ class MainWindow(QMainWindow):
         # Timer
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.silent_refresh)
-        self.timer.start(300000)  # 5 min
+        self.timer.start(15000 if getattr(self.db, "is_remote", False) else 300000)
 
         # Shortcuts
         QShortcut(QKeySequence("Ctrl+B"), self).activated.connect(self.create_backup_now)
@@ -752,8 +758,10 @@ class MainWindow(QMainWindow):
         if ReportBuilderDialog is None or run_report is None:
             error(self, "Kimutatás", "Kimutáskészítő nem elérhető (import hiba).")
             return
+        snapshot = self.data
+        sites = snapshot.get("telephelyek", [])
         try:
-            dlg = ReportBuilderDialog(self, data=self.data, telephelyek=self.data.get("telephelyek", []),
+            dlg = ReportBuilderDialog(self, data=snapshot, telephelyek=sites,
                                       logo_path=str(self.logo_path) if self.logo_path.exists() else None,
                                       initial=getattr(self, "_last_export_options", {}))
         except Exception as e:
@@ -765,7 +773,7 @@ class MainWindow(QMainWindow):
         opts = dlg.get_options()
         self._last_export_options = opts
         try:
-            run_report(self, opts, self.data, self.data.get("telephelyek", []),
+            run_report(self, opts, snapshot, sites,
                        logo_path=str(self.logo_path) if self.logo_path.exists() else None,
                        attachments_dir=str(self.dirs.get("attachments", "")))
         except Exception as ex:
@@ -790,9 +798,10 @@ class MainWindow(QMainWindow):
         for p in paths:
             try:
                 pth = Path(p)
-                total = sum(f.stat().st_size for f in real_attach.iterdir() if f.is_file()) if real_attach.exists() else 0
-                validate_attachment(pth, total)
-                target = safe_copy_to_dir(pth, real_attach)
+                with attachment_write_lock(real_attach):
+                    total = sum(f.stat().st_size for f in real_attach.iterdir() if f.is_file()) if real_attach.exists() else 0
+                    validate_attachment(pth, total)
+                    target = safe_copy_to_dir(pth, real_attach)
                 moved.append(target.name)
             except ValueError as e:
                 logger.warning("Dropped attachment skipped: %s", e)
@@ -822,31 +831,15 @@ class MainWindow(QMainWindow):
     # ---------------- data / sync / search (robust + precompute search index) ----------------
     def refresh_data(self, incremental: bool = True) -> None:
         try:
-            if incremental and self.last_sync:
-                telephelyek = []
-                changes = []
-                try:
-                    telephelyek = self.db.get_telephelyek()
-                except Exception:
-                    logger.exception("get_telephelyek failed")
-                try:
-                    changes = self.db.get_changes(self.last_sync)
-                except Exception:
-                    logger.exception("get_changes failed")
-                if not self.data.get("engedelyek"):
-                    self.data = self.db.get_all_data()
-                else:
-                    self.data["telephelyek"] = telephelyek
-                    cur_map = {e["id"]: e for e in self.data.get("engedelyek", []) if e.get("id")}
-                    for ch in changes:
-                        if ch.get("id"):
-                            cur_map[ch["id"]] = ch
-                    self.data["engedelyek"] = list(cur_map.values())
-            else:
-                self.data = self.db.get_all_data()
-        except Exception:
+            # A consistent snapshot also propagates deletes and avoids client clock skew.
+            snapshot = self.db.get_all_data()
+        except Exception as exc:
             logger.exception("refresh_data failed")
-            self.data = {"telephelyek": [], "engedelyek": []}
+            self.statusBar().showMessage(f"Frissítési hiba; a lista elavult lehet: {exc}")
+            return
+        self.data = snapshot
+        mode = "Központi adatbázis – frissítés 15 másodpercenként" if getattr(self.db, "is_remote", False) else "Helyi adatbázis – nem hálózati többfelhasználós mód"
+        self.statusBar().showMessage(mode)
 
         self.last_sync = datetime.now(timezone.utc).isoformat()
 
@@ -954,6 +947,8 @@ class MainWindow(QMainWindow):
             return
         try:
             self.refresh_data(incremental=True)
+            self.refresh_telephely_filter()
+            self._attachments_cache.clear()
             self.refresh_table()
         except Exception:
             logger.exception("silent_refresh failed")
@@ -1294,11 +1289,8 @@ class MainWindow(QMainWindow):
     def _bulk_archive(self, ents: List[Dict[str, Any]]) -> None:
         if not confirm(self, "Archiválás", f"Archiválja a kijelölt ({len(ents)}) tételt?"):
             return
-        now = datetime.utcnow().isoformat()
         try:
-            with self.db.get_connection() as conn:
-                for e in ents:
-                    conn.execute("UPDATE engedelyek SET archivalt=1, last_modified=? WHERE id=?", (now, e["id"]))
+            self.db.change_permits(ents, "archivalt", 1)
             self._safe_log("engedely_archive_bulk")
             self.refresh_data(incremental=False); self.refresh_table()
         except Exception as ex:
@@ -1308,31 +1300,20 @@ class MainWindow(QMainWindow):
     def _bulk_unarchive(self, ents: List[Dict[str, Any]]) -> None:
         if not confirm(self, "Archiválás visszavonása", f"Visszaállítja archiválást a kijelölt ({len(ents)}) tételeken?"):
             return
-        now = datetime.utcnow().isoformat()
         try:
-            with self.db.get_connection() as conn:
-                for e in ents:
-                    conn.execute("UPDATE engedelyek SET archivalt=0, last_modified=? WHERE id=?", (now, e["id"]))
+            self.db.change_permits(ents, "archivalt", 0)
             self._safe_log("bulk_unarchive")
             self.refresh_data(incremental=False); self.refresh_table()
         except Exception as ex:
             logger.exception("bulk_unarchive failed: %s", ex)
-            error(self, "Archiválás visszavonása", f"Művelet sikertelen")
+            error(self, "Archiválás visszavonása", f"Művelet sikertelen: {ex}")
 
     def _bulk_delete(self, ents: List[Dict[str, Any]]) -> None:
         if not confirm(self, "Törlés", f"Végleg törli a kijelölt ({len(ents)}) tételt?"):
             return
-        now = datetime.utcnow().isoformat()
         try:
-            with self.db.get_connection() as conn:
-                for e in ents:
-                    conn.execute("UPDATE engedelyek SET deleted=1, last_modified=? WHERE id=?", (now, e["id"]))
-                    adir = self.ATTACHMENTS_DIR / e["id"]
-                    if adir.exists():
-                        try:
-                            shutil.rmtree(str(adir))
-                        except Exception:
-                            pass
+            self.db.change_permits(ents, "deleted", 1)
+            # Keep attachments for recovery; an in-flight editor may still reference them.
             self._safe_log("engedely_delete_bulk")
             self.refresh_data(incremental=False); self.refresh_table()
         except Exception as ex:
@@ -1482,33 +1463,7 @@ class MainWindow(QMainWindow):
                 self._retry_permit_save(dlg, eng["id"], updating=True)
 
     def _persist_permit(self, data: Dict[str, Any], entity_id: str, now: str, updating: bool = False) -> None:
-        columns = (
-            "telephely_id", "engedely_nev", "kategoria", "kiado_hatosag",
-            "hatarozatszam", "modosito_hat", "letrejott", "hatarozatlan",
-            "lejarat", "hataly_tipus", "felulvizsgalat_nap", "felulvizsgalat_date",
-            "felulvizsgalatok", "megjegyzes", "hulladek_nv_elokez",
-            "hulladek_v_elokez", "hulladek_nv_gyujt", "hulladek_v_gyujt", "last_modified",
-        )
-        values = dict(data)
-        values["felulvizsgalatok"] = json.dumps(data.get("felulvizsgalatok", []), ensure_ascii=False)
-        values["last_modified"] = now
-        parameters = [values.get(column) for column in columns]
-        with self.db.get_connection() as conn:
-            if updating:
-                assignments = ", ".join(f"{column}=?" for column in columns)
-                cursor = conn.execute(
-                    f"UPDATE engedelyek SET {assignments} WHERE id=? AND COALESCE(deleted, 0)=0",
-                    (*parameters, entity_id),
-                )
-                if cursor.rowcount != 1:
-                    raise sqlite3.IntegrityError("Az engedélyt időközben törölték; a módosítás nem menthető.")
-            else:
-                names = ", ".join(("id", *columns))
-                placeholders = ", ".join("?" for _ in range(len(columns) + 1))
-                conn.execute(
-                    f"INSERT INTO engedelyek ({names}) VALUES ({placeholders})",
-                    (entity_id, *parameters),
-                )
+        self.db.save_permit(data, entity_id, updating)
 
     def _save_dialog_attachments(self, dialog: EngedelyDialog, entity_id: str) -> None:
         while True:
@@ -1546,15 +1501,7 @@ class MainWindow(QMainWindow):
     def del_eng(self, eng: Dict[str, Any]) -> None:
         if confirm(self, "Törlés", "Véglegesen törli ezt az engedélyt?"):
             try:
-                now = datetime.utcnow().isoformat()
-                with self.db.get_connection() as conn:
-                    conn.execute("UPDATE engedelyek SET deleted=1, last_modified=? WHERE id=?", (now, eng["id"]))
-                adir = self.ATTACHMENTS_DIR / eng["id"]
-                if adir.exists():
-                    try:
-                        shutil.rmtree(str(adir))
-                    except Exception:
-                        pass
+                self.db.change_permits([eng], "deleted", 1)
                 # invalidate cache
                 self._attachments_cache.pop(eng["id"], None)
                 self._safe_log("engedely_delete")
@@ -1563,25 +1510,18 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 self.refresh_table()
-            except sqlite3.OperationalError:
-                error(self, "Hiba", "Nem sikerült törölni a zárolás miatt.")
+            except sqlite3.DatabaseError as exc:
+                error(self, "Hiba", f"Nem sikerült törölni: {exc}")
 
     def arc_eng(self, eng: Dict[str, Any]) -> None:
         new_state = 0 if eng.get("archivalt") else 1
-        now = datetime.utcnow().isoformat()
         try:
-            with self.db.get_connection() as conn:
-                conn.execute("UPDATE engedelyek SET archivalt=?, last_modified=? WHERE id=?", (new_state, now, eng["id"]))
+            self.db.change_permits([eng], "archivalt", new_state)
             self._safe_log("engedely_archive_toggle")
-            try:
-                for x in self.data.get("engedelyek", []):
-                    if x.get("id") == eng.get("id"):
-                        x["archivalt"] = new_state; x["last_modified"] = now; break
-            except Exception:
-                pass
+            self.refresh_data(incremental=False)
             self.refresh_table()
-        except sqlite3.OperationalError:
-            error(self, "Hiba", "Nem sikerült archiválni.")
+        except sqlite3.DatabaseError as exc:
+            error(self, "Hiba", f"Nem sikerült archiválni: {exc}")
 
     # ---------------- export / helper public methods ----------------
     def select_items_popup(self, title: str, items: List[str]) -> Optional[List[str]]:

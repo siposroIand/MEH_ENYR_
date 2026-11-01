@@ -31,7 +31,8 @@ from PySide6.QtCore import Qt, QDate
 from config.app_config import get_ordered_categories
 from core.document_ocr import DocumentFields, SUPPORTED_EXTENSIONS
 from gui.ocr_worker import OcrWorker
-from utils.fs_utils import safe_copy_to_dir, validate_attachment
+from gui.ocr_templates import OcrTemplateSelector
+from utils.fs_utils import safe_copy_to_dir, validate_attachment, attachment_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,8 @@ class EngedelyDialog(QDialog):
 
         self._build_ui(telephelyek or [], hatosag_lista or [])
         self._populate_from_entity()
+        self.ocr_template_selector.set_authority(self.kiado.text())
+        self.kiado.textChanged.connect(self.ocr_template_selector.set_authority)
         self.load_attachments()
         self.targy.textChanged.connect(self._subject_changed)
         self.hatary_date.dateChanged.connect(self._validity_changed)
@@ -291,7 +294,7 @@ class EngedelyDialog(QDialog):
         modosito_h.addWidget(self.modosito_add_btn)
         modosito_v.addLayout(modosito_h)
         self.modosito_list = QListWidget()
-        self.modosito_list.setFixedHeight(110)
+        self.modosito_list.setFixedHeight(85)
         modosito_v.addWidget(self.modosito_list)
 
         # új vezérlők: szerkesztés és sorrend módosítás
@@ -302,14 +305,9 @@ class EngedelyDialog(QDialog):
         modosito_ctl_h.addWidget(self.modosito_edit_btn)
         modosito_ctl_h.addWidget(self.modosito_up_btn)
         modosito_ctl_h.addWidget(self.modosito_down_btn)
-        modosito_ctl_h.addStretch()
+        self.modosito_del_btn = QPushButton("Törlés")
+        modosito_ctl_h.addWidget(self.modosito_del_btn)
         modosito_v.addLayout(modosito_ctl_h)
-
-        modosito_del_h = QHBoxLayout()
-        modosito_del_h.addStretch()
-        self.modosito_del_btn = QPushButton("Kiválasztott határozatszám törlése")
-        modosito_del_h.addWidget(self.modosito_del_btn)
-        modosito_v.addLayout(modosito_del_h)
         left_v.addWidget(modosito_box)
 
         # Short note
@@ -438,31 +436,37 @@ class EngedelyDialog(QDialog):
         tabs.setTabEnabled(tabs.indexOf(waste_w), False)
 
         # ---------- Csatolmányok ----------
-        att_w = QGroupBox("Csatolmányok – automatikus adatfelismerés")
-        att_layout = QHBoxLayout(att_w)
-        left_att_col = QVBoxLayout()
-        left_att_col.addWidget(QLabel("Csatolt fájlok:"))
+        att_w = QGroupBox("Csatolmányok")
+        att_layout = QVBoxLayout(att_w)
+        att_layout.setContentsMargins(8, 4, 8, 4)
+        att_toolbar = QHBoxLayout()
+        self.attach_toggle = QPushButton("Fájlok (0)")
+        self.attach_toggle.setCheckable(True)
         self.attach_list = QListWidget()
-        self.attach_list.setMaximumHeight(90)
-        left_att_col.addWidget(self.attach_list)
-        att_layout.addLayout(left_att_col, 1)
-
-        right_att_col = QVBoxLayout()
+        self.attach_list.setFixedHeight(60)
+        self.attach_list.setVisible(False)
+        self.attach_toggle.toggled.connect(self.attach_list.setVisible)
         self.attach_add = QPushButton("Fájl tallózása…")
-        self.attach_del = QPushButton("- Fájl törlése")
-        self.attach_view = QPushButton("👁 Megtekintés")
-        right_att_col.addWidget(self.attach_add)
-        right_att_col.addWidget(self.attach_del)
-        right_att_col.addWidget(self.attach_view)
-        right_att_col.addStretch()
-        att_layout.addLayout(right_att_col)
+        self.attach_del = QPushButton("Fájl törlése")
+        self.attach_view = QPushButton("Megtekintés")
+        self.attach_ocr = QPushButton("Újrafelismerés")
+        self.attach_ocr.setToolTip("A kijelölt fájl felismerése az aktuális OCR-sablonnal.")
+        for button in (self.attach_add, self.attach_toggle, self.attach_view, self.attach_ocr, self.attach_del):
+            att_toolbar.addWidget(button)
+        att_toolbar.addStretch()
+        att_layout.addLayout(att_toolbar)
+        self.ocr_template_selector = OcrTemplateSelector(self)
+        att_layout.addWidget(self.ocr_template_selector)
+        att_layout.addWidget(self.attach_list)
+        self.attach_list.itemSelectionChanged.connect(self._update_attachment_actions)
         self.attach_add.clicked.connect(self.add_attachment)
         self.attach_del.clicked.connect(self.remove_attachment)
         self.attach_view.clicked.connect(self.view_attachment)
-        gen_layout.insertWidget(0, att_w)
+        self.attach_ocr.clicked.connect(self._recognize_selected_attachment)
+        gen_layout.addWidget(att_w)
         self.ocr_status = QLabel("PDF vagy kép tallózásakor a tárgy és a hatály automatikusan kitöltődik.")
         self.ocr_status.setWordWrap(True)
-        gen_layout.insertWidget(1, self.ocr_status)
+        gen_layout.addWidget(self.ocr_status)
 
         # buttons (Save/Cancel)
         btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -824,6 +828,29 @@ class EngedelyDialog(QDialog):
         except OSError as exc:
             logger.exception("Attachment listing failed")
             QMessageBox.warning(self, "Csatolmányok", f"A csatolmányok nem olvashatók: {exc}")
+        self.attach_toggle.setText(f"Fájlok ({self.attach_list.count()})")
+        self.ocr_template_selector.set_document_paths([
+            self.attach_list.item(i).data(Qt.UserRole)
+            for i in range(self.attach_list.count())
+            if self.attach_list.item(i).data(Qt.UserRole).suffix.lower() in SUPPORTED_EXTENSIONS
+        ])
+        if self.attach_list.count():
+            self.attach_list.setCurrentRow(0)
+        self._update_attachment_actions()
+
+    def _update_attachment_actions(self) -> None:
+        selected = self.attach_list.currentItem() is not None
+        self.attach_view.setEnabled(selected)
+        self.attach_del.setEnabled(selected and self._ocr_worker is None)
+        path = self.attach_list.currentItem().data(Qt.UserRole) if selected else None
+        self.attach_ocr.setEnabled(
+            self._ocr_worker is None and path is not None and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+
+    def _recognize_selected_attachment(self) -> None:
+        selected = self.attach_list.currentItem()
+        if selected is not None and self._ocr_worker is None:
+            self._start_ocr([selected.data(Qt.UserRole)])
 
     def add_attachment(self) -> None:
         if self._ocr_worker is not None:
@@ -861,9 +888,9 @@ class EngedelyDialog(QDialog):
     def _start_ocr(self, paths: List[Path]) -> None:
         self._ocr_revisions = (self._subject_revision, self._validity_revision)
         self.ocr_status.setText("Dokumentumok feldolgozása… Az adatmezők közben szerkeszthetők.")
-        for button in (self.attach_add, self.attach_del, self.save_btn):
+        for button in (self.attach_add, self.attach_del, self.attach_ocr, self.save_btn, self.ocr_template_selector):
             button.setEnabled(False)
-        self._ocr_worker = OcrWorker(paths, self)
+        self._ocr_worker = OcrWorker(paths, self, template=self.ocr_template_selector.selected_template())
         self._ocr_worker.result_ready.connect(self._apply_ocr)
         self._ocr_worker.finished.connect(self._ocr_finished)
         self._ocr_worker.start()
@@ -916,8 +943,9 @@ class EngedelyDialog(QDialog):
         self._ocr_worker = None
         if worker:
             worker.deleteLater()
-        for button in (self.attach_add, self.attach_del, self.save_btn):
+        for button in (self.attach_add, self.attach_del, self.attach_ocr, self.save_btn, self.ocr_template_selector):
             button.setEnabled(True)
+        self._update_attachment_actions()
         if self._pending_close is not None:
             result = self._pending_close
             self._pending_close = None
@@ -952,17 +980,26 @@ class EngedelyDialog(QDialog):
     def save_attachments(self, entity_id: str) -> None:
         """Commit staged changes only after the permit was saved successfully."""
         destination = self.attachments_base / entity_id
-        if self._staging_dir.exists():
-            destination.mkdir(parents=True, exist_ok=True)
-            for path in self._staging_dir.iterdir():
-                if path not in self._copied_attachments:
-                    self._copied_attachments[path] = safe_copy_to_dir(path, destination)
-                path.unlink()
-                self._copied_attachments.pop(path)
-            self._staging_dir.rmdir()
-        for path in tuple(self._deleted_attachments):
-            path.unlink(missing_ok=True)
-            self._deleted_attachments.remove(path)
+        with attachment_write_lock(destination):
+            if self._staging_dir.exists():
+                destination.mkdir(parents=True, exist_ok=True)
+                for path in self._staging_dir.iterdir():
+                    if path not in self._copied_attachments:
+                        total = sum(
+                            item.stat().st_size for item in destination.iterdir()
+                            if item.is_file() and item not in self._deleted_attachments
+                        )
+                        try:
+                            validate_attachment(path, total)
+                        except ValueError as exc:
+                            raise OSError(str(exc)) from exc
+                        self._copied_attachments[path] = safe_copy_to_dir(path, destination)
+                    path.unlink()
+                    self._copied_attachments.pop(path)
+                self._staging_dir.rmdir()
+            for path in tuple(self._deleted_attachments):
+                path.unlink(missing_ok=True)
+                self._deleted_attachments.remove(path)
 
     def remove_attachment(self) -> None:
         if self._ocr_worker is not None:
@@ -1028,6 +1065,7 @@ class EngedelyDialog(QDialog):
     # ---------------- collect data ----------------
     def get_data(self) -> dict:
         data = {
+            "revision": self.engedely.get("revision", ""),
             "telephely_id": self.telephely_combo.currentData(),
             "engedely_nev": self.targy.text().strip() or None,
             "kategoria": self.kategoria.currentText(),

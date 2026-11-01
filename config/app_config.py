@@ -1,8 +1,15 @@
 from pathlib import Path
 from typing import Dict, List
+import os
 
 # hálózati gyökér (szerkeszthető) 
-NETWORK_ROOT = Path(r"M:\home\IT apps\MEH_Programok\MEH_Engedelynyilvantarto\#adatbazis")
+NETWORK_ROOT = Path(os.environ.get(
+    "MEH_NETWORK_ROOT", r"M:\home\IT apps\MEH_Programok\MEH_Engedelynyilvantarto\#adatbazis",
+))
+
+SERVER_URL = os.environ.get("MEH_SERVER_URL", "").strip()
+SERVER_TOKEN = os.environ.get("MEH_SERVER_TOKEN", "")
+SERVER_CA_FILE = os.environ.get("MEH_SERVER_CA_FILE", "").strip()
 
 APP_NAME = "MEH - Engedely Nyilvantarto Rendszer"
 DB_FILENAME = "engedelyek.db"
