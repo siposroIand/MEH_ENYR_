@@ -78,3 +78,24 @@ class DatabaseTests(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 operation()
             sleep.assert_not_called()
+
+    def test_changes_include_deletions_and_equal_utc_timestamps(self):
+        with self.db.get_connection() as conn:
+            conn.executemany(
+                "INSERT INTO engedelyek (id, last_modified, deleted) VALUES (?, ?, ?)",
+                [
+                    ("old", "2026-01-01T11:59:59", 0),
+                    ("equal", "2026-01-01T12:00:00", 0),
+                    ("offset", "2026-01-01T13:00:00+01:00", 0),
+                    ("deleted", "2026-01-01T12:00:01", 1),
+                ],
+            )
+        self.assertEqual(
+            {r["id"] for r in self.db.get_changes("2026-01-01T12:00:00+00:00")},
+            {"equal", "offset", "deleted"},
+        )
+
+    def test_changes_failure_is_not_reported_as_empty_success(self):
+        with patch.object(self.db, "get_connection", side_effect=sqlite3.OperationalError("no such table")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.db.get_changes("2026-01-01T12:00:00")

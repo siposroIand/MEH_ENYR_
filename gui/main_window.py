@@ -13,7 +13,6 @@ import sys
 import shutil
 import sqlite3
 import logging
-import subprocess
 import shlex
 import json
 import csv
@@ -87,6 +86,8 @@ from gui.ui_texts import (
     DIALOG_BACKUP_TITLE, DIALOG_ENGEDELY_TITLE
 )
 from gui.ui_helpers import confirm, info, warning, error
+from gui.file_opener import open_local_path
+from gui.ocr_settings_dialog import OcrSettingsDialog
 
 from config import settings
 from utils.fs_utils import sanitize_filename, safe_copy_to_dir, validate_attachment
@@ -328,14 +329,9 @@ class BackupRestoreDialog(QDialog):
             return
         p: Path = sel.data(Qt.UserRole)
         try:
-            folder = str(p.parent)
-            if sys.platform.startswith("win"):
-                os.startfile(folder)
-            elif sys.platform.startswith("darwin"):
-                subprocess.Popen(["open", folder])
-            else:
-                subprocess.Popen(["xdg-open", folder])
-        except Exception as e:
+            open_local_path(p.parent)
+        except OSError as e:
+            logger.exception("Opening backup folder failed")
             warning(self, DIALOG_BACKUP_TITLE, f"Nem sikerült megnyitni: {e}")
 
 
@@ -367,6 +363,7 @@ class ExpiryDialog(QDialog):
         tabs.addTab(make_list_widget(expiring_6m or [], "6 hónap (90-180 nap)"), "6 hónap")
         tabs.addTab(make_list_widget(expiring_3m or [], "3 hónap (0-90 nap)"), "3 hónap")
         tabs.addTab(make_list_widget(expired or [], "Már lejárt"), "Lejárt")
+        tabs.setCurrentIndex(2 if expired else (1 if expiring_3m else 0))
 
         btns = QDialogButtonBox(QDialogButtonBox.Close)
         close_btn = btns.button(QDialogButtonBox.Close); close_btn.setText("Bezár")
@@ -575,8 +572,6 @@ class ReviewDialog(QDialog):
 class MainWindow(QMainWindow):
     """Főablak — optimalizált implementáció"""
 
-    attachmentsCountReady = Signal(str, int)
-
     def __init__(self, db, dirs: Optional[Dict[str, Path]] = None, logo_path: Optional[Path] = None):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
@@ -589,12 +584,15 @@ class MainWindow(QMainWindow):
         self.ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
         self.last_sync: Optional[str] = None
+        self._expiry_dialog: Optional[ExpiryDialog] = None
+        self._expiry_notified: set[tuple] = set()
+        self._expiry_notification_day: Optional[date] = None
         self.data: Dict[str, List[Dict[str, Any]]] = {"telephelyek": [], "engedelyek": []}
+        settings_menu = self.menuBar().addMenu("Beállítások")
+        settings_menu.addAction("OCR-szabályok…", lambda: OcrSettingsDialog(self).exec())
 
         # cache: attachments count per eng id
         self._attachments_cache: Dict[str, int] = {}
-        # temporary set to avoid recomputing immediately multiple times
-        self._attachments_computing: Set[str] = set()
 
         root = QWidget(); self.setCentralWidget(root)
         main_layout = QVBoxLayout(root)
@@ -727,9 +725,6 @@ class MainWindow(QMainWindow):
         # Delete key should act on selected rows in the table only
         QShortcut(QKeySequence(Qt.Key_Delete), self.table).activated.connect(self._delete_selected_via_shortcut)
 
-        # connect attachment count signal
-        self.attachmentsCountReady.connect(self._on_attachments_count_ready)
-
         # connect drop signal from table to handler
         try:
             self.table.filesDropped.connect(self._on_files_dropped)
@@ -745,6 +740,10 @@ class MainWindow(QMainWindow):
         self.refresh_telephely_filter()
         self.refresh_table()
         QTimer.singleShot(0, lambda: self.setWindowState(self.windowState() | Qt.WindowMaximized))
+        self._expiry_startup_timer = QTimer(self)
+        self._expiry_startup_timer.setSingleShot(True)
+        self._expiry_startup_timer.timeout.connect(self.check_expiring_permits)
+        self._expiry_startup_timer.start(0)
 
     # ---------------- Report builder entry point ----------------
     def open_report_builder(self) -> None:
@@ -821,34 +820,33 @@ class MainWindow(QMainWindow):
 
     # ---------------- data / sync / search (robust + precompute search index) ----------------
     def refresh_data(self, incremental: bool = True) -> None:
+        sync_started = datetime.now(timezone.utc).isoformat()
         try:
             if incremental and self.last_sync:
-                telephelyek = []
-                changes = []
-                try:
-                    telephelyek = self.db.get_telephelyek()
-                except Exception:
-                    logger.exception("get_telephelyek failed")
-                try:
-                    changes = self.db.get_changes(self.last_sync)
-                except Exception:
-                    logger.exception("get_changes failed")
+                telephelyek = self.db.get_telephelyek()
+                changes = self.db.get_changes(self.last_sync)
                 if not self.data.get("engedelyek"):
                     self.data = self.db.get_all_data()
                 else:
                     self.data["telephelyek"] = telephelyek
                     cur_map = {e["id"]: e for e in self.data.get("engedelyek", []) if e.get("id")}
                     for ch in changes:
-                        if ch.get("id"):
+                        if ch.get("deleted"):
+                            cur_map.pop(ch["id"], None)
+                        elif ch.get("id"):
                             cur_map[ch["id"]] = ch
                     self.data["engedelyek"] = list(cur_map.values())
             else:
                 self.data = self.db.get_all_data()
-        except Exception:
+        except sqlite3.Error:
             logger.exception("refresh_data failed")
-            self.data = {"telephelyek": [], "engedelyek": []}
+            self.statusBar().showMessage(
+                "Az adatfrissítés sikertelen. A korábbi adatok láthatók; próbálja újra az F5 gombbal.",
+            )
+            raise
 
-        self.last_sync = datetime.now(timezone.utc).isoformat()
+        self.last_sync = sync_started
+        self.statusBar().clearMessage()
 
         def parse_dt_opt(s: Optional[str]):
             if not s:
@@ -937,24 +935,24 @@ class MainWindow(QMainWindow):
             # keep sorted by last_modified/letrejott
             def parse_dt_for_sort(s: Optional[str]):
                 if not s:
-                    return datetime.min
+                    return datetime.min.replace(tzinfo=timezone.utc)
                 try:
-                    return datetime.fromisoformat(s)
+                    parsed = datetime.fromisoformat(s)
+                    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
                 except Exception:
                     try:
-                        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f")
+                        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc)
                     except Exception:
-                        return datetime.min
+                        return datetime.min.replace(tzinfo=timezone.utc)
             self.data["engedelyek"].sort(key=lambda e: parse_dt_for_sort(e.get("last_modified") or e.get("letrejott")), reverse=True)
         except Exception:
             logger.exception("post-process of refresh_data failed")
 
     def silent_refresh(self) -> None:
-        if hasattr(self, "global_search") and self.global_search.hasFocus():
-            return
         try:
             self.refresh_data(incremental=True)
             self.refresh_table()
+            self.check_expiring_permits()
         except Exception:
             logger.exception("silent_refresh failed")
 
@@ -997,63 +995,6 @@ class MainWindow(QMainWindow):
 
     # ---------------- table rendering (optimized) ----------------
 
-    def _attachments_count(self, ent: Dict[str, Any]) -> int:
-        """Visszaadja az enthez tartozó csatolmányok fájlszámát (nem rekurzívan)."""
-        try:
-            eid = ent.get("id")
-            if not eid:
-                return 0
-            # Use cache if available
-            if eid in self._attachments_cache:
-                return self._attachments_cache[eid]
-            adir = self.ATTACHMENTS_DIR / eid
-            if not adir.exists() or not adir.is_dir():
-                self._attachments_cache[eid] = 0
-                return 0
-            cnt = sum(1 for f in adir.iterdir() if f.is_file())
-            self._attachments_cache[eid] = cnt
-            return cnt
-        except Exception:
-            logger.exception("attachments_count failed for %s", ent.get("id"))
-            return 0
-
-    def _ensure_attachments_counts_for_prefix(self, ents: List[Dict[str, Any]], limit: int = 50) -> None:
-        """
-        Compute attachments count for the first `limit` entries (or fewer).
-        This avoids scanning all attachments for large datasets on each refresh.
-        """
-        try:
-            to_check = []
-            for e in ents[:limit]:
-                eid = e.get("id")
-                if not eid:
-                    continue
-                if eid in self._attachments_cache:
-                    continue
-                if eid in self._attachments_computing:
-                    continue
-                to_check.append(eid)
-                self._attachments_computing.add(eid)
-            # compute synchronously but limited quantity -> acceptable for UI responsiveness
-            for eid in to_check:
-                try:
-                    adir = self.ATTACHMENTS_DIR / eid
-                    if not adir.exists() or not adir.is_dir():
-                        cnt = 0
-                    else:
-                        cnt = sum(1 for f in adir.iterdir() if f.is_file())
-                    self._attachments_cache[eid] = cnt
-                except Exception:
-                    self._attachments_cache[eid] = 0
-                    logger.exception("counting attachments failed for %s", eid)
-                finally:
-                    self._attachments_computing.discard(eid)
-            # emit updates to refresh visible cells
-            for eid in to_check:
-                self.attachmentsCountReady.emit(eid, self._attachments_cache.get(eid, 0))
-        except Exception:
-            logger.exception("ensure_attachments_counts failed")
-
     def _on_attachments_count_ready(self, eid: str, cnt: int) -> None:
         """
         Update table cells that contain this entity id in column 8.
@@ -1075,6 +1016,7 @@ class MainWindow(QMainWindow):
             logger.exception("on_attachments_count_ready failed")
 
     def refresh_table(self) -> None:
+        self.table.setUpdatesEnabled(False)
         try:
             self.table.setRowCount(0); self.table.setSortingEnabled(False)
             items = self._get_filtered_items()
@@ -1083,12 +1025,6 @@ class MainWindow(QMainWindow):
 
             # Precompute telephely name map for speed
             tp_name_map = {t["id"]: t.get("nev", "Ism.") for t in self.data.get("telephelyek", [])}
-
-            # Ensure attachment counts for first N rows only to keep UI snappy
-            try:
-                self._ensure_attachments_counts_for_prefix(items, limit=60)
-            except Exception:
-                logger.exception("attachment ensure precompute failed")
 
             for r, e in enumerate(items):
                 tp_name = tp_name_map.get(e.get("telephely_id"), "Ism.")
@@ -1199,15 +1135,14 @@ class MainWindow(QMainWindow):
                 self.table.setItem(r, 7, item_megj)
 
                 # last column: lightweight text item with attachments count (no per-row widgets)
-                try:
-                    files_count = self._attachments_cache.get(e.get("id"), 0)
-                except Exception:
-                    files_count = 0
-
-                attach_text = f"Megnyitás ({files_count})" if files_count > 0 else "Nincs csatolmány"
+                files_count = self._attachments_cache.get(e.get("id"))
+                attach_text = (
+                    "Megnyitás" if files_count is None else
+                    (f"Megnyitás ({files_count})" if files_count > 0 else "Nincs csatolmány")
+                )
                 item_btn = QTableWidgetItem(attach_text)
                 item_btn.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                item_btn.setToolTip("Megnyitás: dupla kattintás" if files_count > 0 else "Nincsenek csatolmányok ehhez a tételhez.")
+                item_btn.setToolTip("Megnyitás: dupla kattintás")
                 self.table.setItem(r, 8, item_btn)
 
                 # set background/foreground for full row cells
@@ -1222,6 +1157,9 @@ class MainWindow(QMainWindow):
             self.table.setSortingEnabled(True)
         except Exception:
             logger.exception("refresh_table failed")
+        finally:
+            self.table.setSortingEnabled(True)
+            self.table.setUpdatesEnabled(True)
 
     def _on_table_context_menu(self, pos: QPoint) -> None:
         try:
@@ -1236,12 +1174,8 @@ class MainWindow(QMainWindow):
                 a_delete = QAction("Törlés", self); a_delete.triggered.connect(lambda _, e=ent: self.del_eng(e))
                 menu.addAction(a_edit); menu.addAction(a_archive); menu.addAction(a_delete)
                 menu.addSeparator()
-                try:
-                    files_count = self._attachments_cache.get(ent.get("id"), None)
-                    if files_count is None:
-                        files_count = self._attachments_count(ent)
-                except Exception:
-                    files_count = 0
+                a_open = menu.addAction("Csatolmányok megnyitása")
+                a_open.triggered.connect(lambda _, e=ent: self._open_with_preference(e))
                 a_copy = QAction("Másolás: Határozatszám", self); a_copy.triggered.connect(lambda _, e=ent: QApplication.clipboard().setText(str(e.get("hatarozatszam") or "")))
                 a_export = QAction("Export (PDF) — csak ez a tétel", self); a_export.triggered.connect(lambda _, e=ent: self._export_single_record(e))
                 menu.addAction(a_copy); menu.addAction(a_export)
@@ -1348,28 +1282,17 @@ class MainWindow(QMainWindow):
         adir = self.ATTACHMENTS_DIR / eng["id"]
         try:
             if not adir.exists() or not adir.is_dir():
+                self._attachments_cache[eng["id"]] = 0
+                self._on_attachments_count_ready(eng["id"], 0)
                 info(self, "Fájlok", INFO_NO_ATTACHMENTS)
                 return
             files = [f for f in adir.iterdir() if f.is_file()]
+            self._attachments_cache[eng["id"]] = len(files)
+            self._on_attachments_count_ready(eng["id"], len(files))
             if len(files) == 0:
                 info(self, "Fájlok", INFO_NO_ATTACHMENTS)
                 return
-            if len(files) == 1:
-                fpath = str(files[0])
-                if sys.platform.startswith("win"):
-                    os.startfile(fpath)
-                elif sys.platform.startswith("darwin"):
-                    subprocess.Popen(["open", fpath])
-                else:
-                    subprocess.Popen(["xdg-open", fpath])
-            else:
-                folder = str(adir)
-                if sys.platform.startswith("win"):
-                    os.startfile(folder)
-                elif sys.platform.startswith("darwin"):
-                    subprocess.Popen(["open", folder])
-                else:
-                    subprocess.Popen(["xdg-open", folder])
+            open_local_path(files[0] if len(files) == 1 else adir)
         except Exception as e:
             logger.exception("open attachments failed: %s", e)
             warning(self, "Fájlok", f"Nem sikerült megnyitni: {e}")
@@ -1745,16 +1668,18 @@ class MainWindow(QMainWindow):
             self.refresh_data(incremental=False)
             self.refresh_telephely_filter()
             self.refresh_table()
+            self.check_expiring_permits()
             self._safe_log("manual_refresh")
         except Exception:
             logger.exception("manual_refresh failed")
 
     # ---------------- expiry / reviews ----------------
-    def check_expiring_permits(self) -> None:
+    def _expiring_groups(self) -> tuple[list, list, list]:
         today = date.today()
         expiring_6m = []; expiring_3m = []; expired = []
+        sites = {t["id"]: t.get("nev", "Ismeretlen") for t in self.data.get("telephelyek", [])}
         for e in self.data.get("engedelyek", []):
-            if e.get("archivalt"):
+            if e.get("archivalt") or e.get("deleted"):
                 continue
             hataly = e.get("hataly_tipus") or ("indefinite" if e.get("hatarozatlan") else "fixed")
             if hataly != "fixed":
@@ -1762,11 +1687,9 @@ class MainWindow(QMainWindow):
             if not e.get("lejarat"):
                 continue
             try:
-                lej_dt = e.get("_lej_dt")
-                if not lej_dt:
-                    continue
+                lej_dt = e.get("_lej_dt") or date.fromisoformat(e["lejarat"])
                 days = (lej_dt - today).days
-                tp = next((t["nev"] for t in self.data.get("telephelyek", []) if t["id"] == e["telephely_id"]), "Ismeretlen")
+                tp = sites.get(e.get("telephely_id"), "Ismeretlen")
                 rec = e.copy(); rec["telephely_nev"] = tp
                 if days < 0:
                     expired.append(rec)
@@ -1774,43 +1697,49 @@ class MainWindow(QMainWindow):
                     expiring_3m.append(rec)
                 elif 90 < days <= 180:
                     expiring_6m.append(rec)
-            except Exception:
-                continue
+            except (ValueError, TypeError):
+                logger.warning("Invalid expiry date for permit %s: %s", e.get("id"), e.get("lejarat"))
+        for group in (expiring_6m, expiring_3m, expired):
+            group.sort(key=lambda record: record["lejarat"])
+        return expiring_6m, expiring_3m, expired
 
-        if expiring_6m or expiring_3m or expired:
-            ExpiryDialog(expiring_6m=expiring_6m, expiring_3m=expiring_3m, expired=expired, parent=self).show()
+    def check_expiring_permits(self) -> None:
+        # Do not interrupt editing, or consume a notification before it can be shown.
+        if QApplication.activeModalWidget() is not None:
+            return
+        if self._expiry_dialog is not None and self._expiry_dialog.isVisible():
+            return
+        today = date.today()
+        if today != self._expiry_notification_day:
+            self._expiry_notification_day = today
+            self._expiry_notified.clear()
+        groups = self._expiring_groups()
+        keys = {
+            (entry.get("id"), entry["lejarat"], index)
+            for index, group in enumerate(groups) for entry in group
+        }
+        if not keys.difference(self._expiry_notified):
+            return
+        self._expiry_dialog = ExpiryDialog(*groups, parent=self)
+        self._expiry_dialog.setAttribute(Qt.WA_DeleteOnClose)
+        self._expiry_dialog.finished.connect(self._expiry_closed)
+        self._expiry_dialog.show()
+        self._expiry_dialog.raise_()
+        self._expiry_notified.update(keys)
+
+    def _expiry_closed(self, _result: int) -> None:
+        self._expiry_dialog = None
 
     def show_expiring_dialog(self) -> None:
-        today = date.today()
-        expiring_6m = []; expiring_3m = []; expired = []
-        for e in self.data.get("engedelyek", []):
-            if e.get("archivalt"):
-                continue
-            hataly = e.get("hataly_tipus") or ("indefinite" if e.get("hatarozatlan") else "fixed")
-            if hataly != "fixed":
-                continue
-            if not e.get("lejarat"):
-                continue
-            try:
-                lej_dt = e.get("_lej_dt")
-                if not lej_dt:
-                    continue
-                days = (lej_dt - today).days
-                tp = next((t["nev"] for t in self.data.get("telephelyek", []) if t["id"] == e["telephely_id"]), "Ismeretlen")
-                rec = e.copy(); rec["telephely_nev"] = tp
-                if days < 0:
-                    expired.append(rec)
-                elif 0 <= days <= 90:
-                    expiring_3m.append(rec)
-                elif 90 < days <= 180:
-                    expiring_6m.append(rec)
-            except Exception:
-                continue
-
-        if expiring_6m or expiring_3m or expired:
-            ExpiryDialog(expiring_6m=expiring_6m, expiring_3m=expiring_3m, expired=expired, parent=self).exec()
+        if self._expiry_dialog is not None and self._expiry_dialog.isVisible():
+            self._expiry_dialog.raise_()
+            self._expiry_dialog.activateWindow()
+            return
+        groups = self._expiring_groups()
+        if any(groups):
+            ExpiryDialog(*groups, parent=self).exec()
         else:
-            info(self, "Lejáratok", "Nincsenek lejáró engedélyek a kiválasztott szűrés mellett.")
+            info(self, "Lejáratok", "Nincsenek lejárt vagy 180 napon belül lejáró aktív engedélyek.")
 
     def show_reviews_dialog(self) -> None:
         review_all = []

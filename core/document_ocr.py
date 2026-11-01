@@ -42,6 +42,24 @@ class DocumentFields:
     warnings: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ExtractionRule:
+    start: str = ""
+    end: str = ""
+
+    def __post_init__(self):
+        if not isinstance(self.start, str) or not isinstance(self.end, str):
+            raise ValueError("A keresőkifejezéseknek szövegnek kell lenniük.")
+        if self.end.strip() and not self.start.strip():
+            raise ValueError("Záró kifejezéshez kezdő kifejezés is szükséges.")
+
+
+@dataclass(frozen=True)
+class OcrRules:
+    subject: ExtractionRule = ExtractionRule()
+    validity: ExtractionRule = ExtractionRule()
+
+
 def _fold(value: str) -> str:
     return "".join(
         c for c in unicodedata.normalize("NFKD", value.casefold())
@@ -49,7 +67,7 @@ def _fold(value: str) -> str:
     )
 
 
-def extract_fields(text: str) -> DocumentFields:
+def _extract_default_fields(text: str) -> DocumentFields:
     """Only consume labelled values; never infer expiry from unrelated dates."""
     text = unicodedata.normalize("NFC", text).replace("\r\n", "\n").replace("\r", "\n")
     labels = list(_LABEL.finditer(text))
@@ -121,6 +139,79 @@ def extract_fields(text: str) -> DocumentFields:
     )
 
 
+def _rule_values(text: str, rule: ExtractionRule) -> tuple[list[str], list[str]]:
+    def pattern(marker: str):
+        marker = unicodedata.normalize("NFC", marker.strip())
+        escaped = r"\s+".join(re.escape(part) for part in marker.split())
+        prefix = r"(?<!\w)" if marker[0].isalnum() else ""
+        suffix = r"(?!\w)" if marker[-1].isalnum() else ""
+        return re.compile(prefix + escaped + suffix, re.IGNORECASE)
+
+    starts = list(pattern(rule.start).finditer(text))
+    end_pattern = pattern(rule.end) if rule.end.strip() else None
+    values = []
+    warnings = []
+    for index, start in enumerate(starts):
+        limit = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+        remaining = text[start.end():limit]
+        if end_pattern:
+            end = end_pattern.search(remaining)
+            if end is None:
+                warnings.append(f"Nem található záró kifejezés: {rule.end}")
+                continue
+            value = remaining[:end.start()]
+        else:
+            lines = remaining.lstrip(" \t:;–—-\n").splitlines()
+            value_lines = []
+            for line in lines:
+                if not line.strip() or _NEXT_FIELD.match(line):
+                    break
+                value_lines.append(line.strip())
+            value = " ".join(value_lines)
+        value = " ".join(value.strip(" \t:;–—-\n").split())
+        if value:
+            values.append(value)
+    if not starts:
+        warnings.append(f"Nem található kezdő kifejezés: {rule.start}")
+    elif not values and not warnings:
+        warnings.append(f"A keresőkifejezés után nincs érték: {rule.start}")
+    return values, warnings
+
+
+def extract_fields(text: str, rules: OcrRules | None = None) -> DocumentFields:
+    """Custom rules replace default recognition only for the configured field."""
+    if rules is None or rules == OcrRules():
+        return _extract_default_fields(text)
+    text = unicodedata.normalize("NFC", text).replace("\r\n", "\n").replace("\r", "\n")
+    # Do not retain warnings or values from the default rule for an overridden field.
+    default_labels = list(_LABEL.finditer(text))
+    default_parts = []
+    for index, label in enumerate(default_labels):
+        rule = rules.subject if _fold(label.group(1)) == "targy" else rules.validity
+        if not rule.start.strip():
+            end = default_labels[index + 1].start() if index + 1 < len(default_labels) else len(text)
+            default_parts.append(text[label.start():end])
+    defaults = _extract_default_fields("\n\n".join(default_parts))
+    subject, expiry, validity = defaults.subject, defaults.expiry, defaults.validity
+    warnings = list(defaults.warnings)
+    if rules.subject.start.strip():
+        values, issues = _rule_values(text, rules.subject)
+        warnings.extend(issues)
+        unique = set(values)
+        subject = next(iter(unique)) if len(unique) == 1 and not issues else None
+        if len(unique) > 1:
+            warnings.append("Több eltérő tárgy található; a tárgyat kézzel kell megadni.")
+    if rules.validity.start.strip():
+        values, issues = _rule_values(text, rules.validity)
+        warnings.extend(issues)
+        parsed = [_extract_default_fields(f"Érvényes: {value}") for value in values]
+        merged = merge_fields(parsed)
+        warnings.extend(merged.warnings)
+        if not issues and all(value.validity for value in parsed):
+            expiry, validity = merged.expiry, merged.validity
+    return DocumentFields(subject, expiry, validity, tuple(dict.fromkeys(warnings)))
+
+
 def merge_fields(results: list[DocumentFields]) -> DocumentFields:
     subjects = {r.subject for r in results if r.subject}
     validities = {(r.validity, r.expiry) for r in results if r.validity}
@@ -136,7 +227,9 @@ def merge_fields(results: list[DocumentFields]) -> DocumentFields:
     )
 
 
-def read_document(path: Path, cancelled: Callable[[], bool] = lambda: False) -> DocumentFields:
+def read_document(
+    path: Path, cancelled: Callable[[], bool] = lambda: False, rules: OcrRules | None = None,
+) -> DocumentFields:
     """Read native PDF text first, OCR scanned pages/images with Hungarian Tesseract."""
     try:
         import pypdfium2 as pdfium
@@ -172,7 +265,7 @@ def read_document(path: Path, cancelled: Callable[[], bool] = lambda: False) -> 
                     with closing(document[index]) as page:
                         with closing(page.get_textpage()) as textpage:
                             text = textpage.get_text_range()
-                        fields = extract_fields(text)
+                        fields = extract_fields(text, rules)
                         # Covers scanned and mixed pages (e.g. a text footer over a scan).
                         has_images = any(page.get_objects(filter=[pdfium.raw.FPDF_PAGEOBJ_IMAGE]))
                         if has_images and (not fields.subject or not fields.validity):
@@ -180,7 +273,7 @@ def read_document(path: Path, cancelled: Callable[[], bool] = lambda: False) -> 
                             try:
                                 with closing(page.render(scale=scale)) as bitmap:
                                     with bitmap.to_pil() as image:
-                                        scanned_fields = extract_fields(ocr(image))
+                                        scanned_fields = extract_fields(ocr(image), rules)
                             except (OSError, RuntimeError) as exc:
                                 if not text.strip():
                                     raise
@@ -199,7 +292,7 @@ def read_document(path: Path, cancelled: Callable[[], bool] = lambda: False) -> 
         else:
             with Image.open(path) as image:
                 for frame in ImageSequence.Iterator(image):
-                    results.append(extract_fields(ocr(frame)))
+                    results.append(extract_fields(ocr(frame), rules))
         check_cancelled()
         return merge_fields(results)
     except DocumentReadCancelled:
