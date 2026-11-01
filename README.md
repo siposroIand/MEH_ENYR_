@@ -41,7 +41,9 @@ python main.py
 
 A telepítés a `tesseract --list-langs` paranccsal ellenőrizhető: szerepeljen a
 listában a `hun`. A szöveges PDF-részek közvetlen olvasásához nem szükséges
-Tesseract. **A dokumentumok nem kerülnek külső OCR-szolgáltatóhoz.**
+Tesseract. **A helyi OCR és az OCR-sablonok nem küldenek dokumentumot külső
+szolgáltatóhoz.** Az alábbi, külön jóváhagyást kérő **AI-kitöltés** viszont
+az OpenAI API-t használja.
 
 ## Adatfelvitel és csatolmányok
 
@@ -117,6 +119,88 @@ A sablonok a Qt `AppLocalDataLocation/ocr_templates` könyvtárában,
 felhasználónként helyileg tárolódnak JSON-fájlokként. A mentett profil nem
 tartalmazza a mintadokumentumot vagy annak felismert szövegét.
 **Mentés előtt minden OCR-eredményt ellenőrizzen.**
+
+### AI-kitöltés OpenAI-val
+
+Az **AI-kitöltés…** a szkennelt oldalak képét értelmezi, nem függ a Tesseract
+felismerésének minőségétől és nem igényel előre kijelölt OCR-sablont.
+Négy mezőhöz ad javaslatot: **kiadó hatóság, keltezés, hatály/lejárat, tárgy**.
+Ez kiegészítő, választható művelet; a tallózás és az Újrafelismerés gomb
+továbbra is kizárólag helyi OCR-t indít.
+
+1. A fájllistában jelöljön ki egy PDF-et vagy képet, majd kattintson az
+   **AI-kitöltés…** gombra. Az összes oldal előnézete helyben elkészül;
+   ekkor még nincs külső dokumentumfeltöltés.
+2. Ellenőrizze az oldalképeket. Csak külső feldolgozásra jóváhagyott,
+   nem bizalmas dokumentumot használjon. A jelölőnégyzet jóváhagyása után
+   a **Küldés az OpenAI-nak** gomb továbbítja a kiválasztott dokumentum
+   **összes oldalképét**, nem csak a felismerendő mezőket.
+3. A válaszban a mező mellett oldalszám, forrásidézet és állapot jelenik
+   meg. A sorra kattintva az idézett oldalra léphet, az előnézet nagyítható.
+   **Az idézet is AI által előállított javaslat, nem független bizonyíték:
+   ellenőrizze az eredeti oldalon.** Bizonytalan vagy hiányzó adat nem
+   vehető át automatikusan; ezeket kézzel adja meg.
+4. Jelölje be egyenként az átveendő mezőket, majd válassza a
+   **Kijelölt javaslatok átvétele** gombot. Alapból egyik mező sincs
+   kijelölve. A közben kézzel módosított mezők megmaradnak. Ez csak az
+   adatlapot tölti ki: az engedély rögzítéséhez külön **Mentés** szükséges.
+
+A modell utasítása megkülönbözteti a kiadót az ügyféltől, a keltezést
+a hatálybalépéstől és a lejáratot a felülvizsgálati határidőtől.
+Kezdődátumból vagy relatív időtartamból nem kérünk kiszámított lejáratot.
+A „határozatlan” és „változtatásig/visszavonásig” állapot külön kezelhető.
+Hibás dátumot, érvénytelen forrásoldalt, túl hosszú szöveget vagy hiányzó
+idézetet az alkalmazás elutasít; a keltezés előtti lejáratot bizonytalannak
+jelöli. Ez nem teszi tévedhetetlenné az AI-t, ezért az emberi ellenőrzés
+kötelező.
+
+#### API-beállítás
+
+Külön OpenAI API-fiók, API-kulcs és használati keret szükséges; a ChatGPT
+előfizetés önmagában nem biztosít API-keretet. Központi módban **csak a
+szervergépen**, a szolgáltatás indítása előtt állítsa be:
+
+```powershell
+$env:OPENAI_API_KEY = "<OpenAI API-kulcs>"
+$env:MEH_OPENAI_MODEL = "gpt-4.1"
+```
+
+Ezután ugyanabban a környezetben indítsa a `python -m core.db_service ...`
+szolgáltatást. Egygépes módban a változókat a `python main.py` indítása
+előtt, a helyi gépen kell beállítani. A `MEH_OPENAI_MODEL` elhagyható,
+alapértéke `gpt-4.1`; más modellnek a Responses API képbevitelét és a
+szigorú JSON-séma szerinti választ is támogatnia kell. A tényleges
+modellhozzáférés az API-fióktól függ.
+
+Az API-kulcs nem kerül az adatbázisba, csatolmányba vagy sablonba, és
+központi módban nem adjuk át a klienseknek. Ne tegye a kulcsot a közös
+mappába, forráskódba vagy verziókezelt indítófájlba. A központi szolgáltatás
+AI-végpontjához ugyanaz a hitelesített HTTPS-kapcsolat szükséges, mint az
+adatkezeléshez. A szolgáltatást futtató gépen a projekt függőségei is
+legyenek telepítve; az oldalképek ellenőrzéséhez Pillow szükséges.
+
+#### Adatkezelés, korlátok, hibák
+
+A kliens memóriában JPEG-oldalképeket készít (legfeljebb 2400 pixel hosszú
+oldal); az eredeti fájlt nem módosítja. Egy kérés egy dokumentum, legfeljebb
+20 oldal, oldalanként 2 MB, összesen 16 MB képadat. Ha bármely korlátot
+túllépi, nem küldünk csonka dokumentumot: hibaüzenetet kap. Többoldalas TIFF
+és szkennelt PDF is támogatott. A teljes oldal feldolgozása használati
+díjjal járhat; állítson be költségkeretet az OpenAI-projektben.
+
+Az API-kérés `store: false` beállítású, nem használ fájlfeltöltési
+végpontot, és az alkalmazás nem naplózza a dokumentumot, az AI-válasz
+tartalmát vagy az API-kulcsot. **Ez nem jelent garantált nulla megőrzést
+az OpenAI oldalán**: a szolgáltató adatkezelési szabályait és a fiók
+beállításait az üzemeltetőnek külön jóvá kell hagynia.
+
+Hiányzó kulcs, szolgáltatói elutasítás, kvótahiba, hálózati hiba vagy
+érvénytelen válasz esetén az adatlap nem változik. Nincs automatikus
+újraküldés, mert annak újabb díja lehet. A hálózati várakozás időkorlátos;
+megszakításkor az ablak megvárja a folyamat végét, de az elküldött külső
+kérés már nem vonható vissza. Központi módban legfeljebb két AI-feldolgozás
+fut egyszerre; a harmadik felhasználó egyértelmű foglaltsági üzenetet kap,
+az adatbázis-műveletek ettől továbbra is használhatók.
 
 ## Kimutatáskészítő
 

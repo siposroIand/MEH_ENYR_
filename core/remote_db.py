@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, HTTPSHandler, HTTPRedirectHandler
 
 from core.db import ConflictError
+from core.document_ai import AI_TIMEOUT, AiError, parse_result
 
 
 class RemoteDatabaseError(sqlite3.DatabaseError):
@@ -43,13 +44,15 @@ class RemoteDatabase:
             raise RemoteDatabaseError("A központi szolgáltatás verziója nem támogatott.")
 
     def _call(self, method: str, **params):
+        is_ai = method in ("ai_capabilities", "ai_extract")
         request = Request(
-            self.url, data=json.dumps({"method": method, "params": params}).encode("utf-8"),
+            self.url.removesuffix("/api") + "/ai" if is_ai else self.url,
+            data=json.dumps({"method": method, "params": params}).encode("utf-8"),
             headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"},
             method="POST",
         )
         try:
-            with self._opener.open(request, timeout=15) as response:
+            with self._opener.open(request, timeout=AI_TIMEOUT + 30 if method == "ai_extract" else 15) as response:
                 result = json.load(response)
             return result["result"]
         except HTTPError as exc:
@@ -59,8 +62,15 @@ class RemoteDatabase:
                 message = f"A központi szolgáltatás hibát jelzett (HTTP {exc.code})."
             if exc.code == 409:
                 raise ConflictError(message) from exc
+            if is_ai:
+                raise AiError(message) from None
             raise RemoteDatabaseError(message) from exc
         except (URLError, OSError, HTTPException, ValueError, KeyError, TypeError) as exc:
+            if is_ai:
+                raise AiError(
+                    "Az AI-szolgáltatás válasza nem érkezett meg. Nincs automatikus újraküldés; "
+                    "a már elküldött OpenAI-kérés díja felmerülhet. Az adatlap nem változott."
+                ) from None
             raise RemoteDatabaseError(
                 "A központi szolgáltatás nem érhető el vagy érvénytelen választ adott. "
                 "Mentés közbeni kapcsolathibánál a mentés eredménye bizonytalan: "
@@ -96,3 +106,15 @@ class RemoteDatabase:
 
     def log_event(self, note: str | None = None):
         return self._call("log_event", note=note)
+
+    def ai_capabilities(self) -> dict:
+        result = self._call("ai_capabilities")
+        if (not isinstance(result, dict) or type(result.get("enabled")) is not bool
+                or not isinstance(result.get("model"), str)):
+            raise AiError("A szerver AI-beállításainak válasza hibás.")
+        return result
+
+    def ai_extract(self, images: list[str], consent: bool):
+        if consent is not True:
+            raise AiError("Külső AI-feldolgozáshoz külön jóváhagyás szükséges.")
+        return parse_result(self._call("ai_extract", images=images, consent=True), len(images))
