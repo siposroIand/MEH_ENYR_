@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from core.document_ocr import (
     DocumentFields, DocumentReadCancelled, DocumentReadError,
-    extract_fields, merge_fields, read_document,
+    ExtractionRule, OcrRules, extract_fields, merge_fields, read_document,
 )
 
 
@@ -143,3 +143,70 @@ class DocumentReadingTests(unittest.TestCase):
                 with patch("pytesseract.image_to_string", side_effect=error):
                     with self.assertRaises(DocumentReadError):
                         read_document(path)
+
+    def test_custom_rules_reach_image_reader(self):
+        image = self.make_image()
+        self.addCleanup(image.close)
+        path = self.root / "rules.png"
+        image.save(path)
+        rules = OcrRules(ExtractionRule("Kezdet", "Vége"), ExtractionRule("Lejárat", "Zárás"))
+        with patch("pytesseract.image_to_string", return_value="Kezdet próba Vége Lejárat 2030.12.31. Zárás"):
+            fields = read_document(path, rules=rules)
+        self.assertEqual(fields.subject, "próba")
+        self.assertEqual(fields.expiry, date(2030, 12, 31))
+
+
+class CustomRuleTests(unittest.TestCase):
+    def test_after_marker_and_between_markers(self):
+        rules = OcrRules(ExtractionRule("Tárgy"), ExtractionRule("Érvényes", "lezárás"))
+        fields = extract_fields("TÁRGY: Hulladék engedély\n\nÉrvényes 2030.12.31. lezárás", rules)
+        self.assertEqual(fields.subject, "Hulladék engedély")
+        self.assertEqual(fields.expiry, date(2030, 12, 31))
+
+    def test_literals_whitespace_accents_and_multiline(self):
+        rules = OcrRules(subject=ExtractionRule("A tárgy [kezdete]:", "(vége)"))
+        fields = extract_fields("a  tárgy\n[kezdete]:Első\nmásodik (vége)", rules)
+        self.assertEqual(fields.subject, "Első második")
+
+    def test_configured_rule_does_not_fallback(self):
+        rules = OcrRules(subject=ExtractionRule("Kezdet", "Vége"))
+        fields = extract_fields("Tárgy: Beépített\nÉrvényes: 2030.01.01.", rules)
+        self.assertIsNone(fields.subject)
+        self.assertEqual(fields.expiry, date(2030, 1, 1))
+        self.assertTrue(fields.warnings)
+
+    def test_missing_end_and_conflicting_values_are_not_applied(self):
+        for text in ("Kezdet érték", "Kezdet egy Vége\nKezdet kettő Vége", "Kezdet egy Vége\nKezdet kettő"):
+            fields = extract_fields(text, OcrRules(subject=ExtractionRule("Kezdet", "Vége")))
+            self.assertIsNone(fields.subject)
+            self.assertTrue(fields.warnings)
+
+    def test_end_marker_does_not_cross_another_start(self):
+        fields = extract_fields(
+            "Kezdet hibás\nKezdet jó Vége", OcrRules(subject=ExtractionRule("Kezdet", "Vége")),
+        )
+        self.assertIsNone(fields.subject)
+        self.assertTrue(fields.warnings)
+
+    def test_start_does_not_match_inside_word(self):
+        fields = extract_fields("Érvényesség: 2030.01.01.", OcrRules(validity=ExtractionRule("Érvényes")))
+        self.assertIsNone(fields.validity)
+
+    def test_validity_rules_preserve_conservative_parsing(self):
+        rules = OcrRules(validity=ExtractionRule("Lejárat", "Vége"))
+        for value in ("2030.02.30.", "2028.01.01-től", "öt év", "2030.01.01. vagy 2031.01.01."):
+            with self.subTest(value=value):
+                fields = extract_fields(f"Lejárat {value} Vége", rules)
+                self.assertIsNone(fields.validity)
+                self.assertTrue(fields.warnings)
+        self.assertEqual(extract_fields("Lejárat határozatlan Vége", rules).validity, "indefinite")
+
+    def test_default_warnings_for_overridden_field_are_not_kept(self):
+        rules = OcrRules(validity=ExtractionRule("Lejárat", "Vége"))
+        fields = extract_fields("Érvényes: hibás\nLejárat 2030.12.31. Vége", rules)
+        self.assertEqual(fields.expiry, date(2030, 12, 31))
+        self.assertEqual(fields.warnings, ())
+
+    def test_rejects_end_without_start(self):
+        with self.assertRaises(ValueError):
+            ExtractionRule(end="Vége")

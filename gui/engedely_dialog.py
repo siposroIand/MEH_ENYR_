@@ -11,7 +11,6 @@ Felülvizsgálat: egyszerűsítve — csak FIX dátum vagy "n nappal a lejárat 
 from __future__ import annotations
 
 import mimetypes
-import subprocess
 import json
 import logging
 from uuid import uuid4
@@ -31,6 +30,8 @@ from PySide6.QtCore import Qt, QDate
 from config.app_config import get_ordered_categories
 from core.document_ocr import DocumentFields, SUPPORTED_EXTENSIONS
 from gui.ocr_worker import OcrWorker
+from gui.file_opener import open_local_path
+from gui.ocr_settings_dialog import OcrSettingsDialog, load_ocr_rules
 from utils.fs_utils import safe_copy_to_dir, validate_attachment
 
 logger = logging.getLogger(__name__)
@@ -191,7 +192,7 @@ class EngedelyDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Engedély adatlap")
         # szélesebb popup a kérésnek megfelelően
-        self.resize(1100, 720)
+        self.resize(1060, 640)
 
         self.engedely = engedely or {}
         self.temp_id = str(uuid4())
@@ -219,7 +220,7 @@ class EngedelyDialog(QDialog):
 
     def _build_ui(self, telephelyek: List[dict], hatosag_lista: List[str]) -> None:
         main_v = QVBoxLayout(self)
-        main_v.setSpacing(10)
+        main_v.setSpacing(6)
 
         tabs = QTabWidget()
         main_v.addWidget(tabs)
@@ -233,8 +234,8 @@ class EngedelyDialog(QDialog):
         # Left column: basic meta
         left_pane = QWidget()
         left_v = QVBoxLayout(left_pane)
-        left_v.setContentsMargins(8, 8, 8, 8)
-        left_v.setSpacing(8)
+        left_v.setContentsMargins(0, 0, 0, 0)
+        left_v.setSpacing(6)
 
         left_box = QGroupBox("Alapadatok")
         form_left = QFormLayout(left_box)
@@ -310,22 +311,26 @@ class EngedelyDialog(QDialog):
         self.modosito_del_btn = QPushButton("Kiválasztott határozatszám törlése")
         modosito_del_h.addWidget(self.modosito_del_btn)
         modosito_v.addLayout(modosito_del_h)
-        left_v.addWidget(modosito_box)
+        details = QWidget()
+        details_layout = QVBoxLayout(details)
+        details_layout.addWidget(modosito_box)
+        details_layout.addStretch()
 
         # Short note
         self.megjegyzes = QTextEdit()
         self.megjegyzes.setPlaceholderText("Megjegyzés írása...")
-        self.megjegyzes.setFixedHeight(80)
+        self.megjegyzes.setFixedHeight(64)
         left_v.addWidget(QLabel("Megjegyzés"))
         left_v.addWidget(self.megjegyzes)
+        left_v.addStretch()
 
         splitter.addWidget(left_pane)
 
         # Right column: dates & reviews
         right_pane = QWidget()
         right_v = QVBoxLayout(right_pane)
-        right_v.setContentsMargins(8, 8, 8, 8)
-        right_v.setSpacing(8)
+        right_v.setContentsMargins(0, 0, 0, 0)
+        right_v.setSpacing(6)
 
         right_box = QGroupBox("Időbeli adatok")
         form_right = QFormLayout(right_box)
@@ -351,14 +356,15 @@ class EngedelyDialog(QDialog):
         self.rb_indef.toggled.connect(self._on_hataly_changed)
         self.rb_until_mod.toggled.connect(self._on_hataly_changed)
 
-        hb_layout.addWidget(self.rb_fixed)
         row = QHBoxLayout()
-        row.addSpacing(8)
+        row.addWidget(self.rb_fixed)
         row.addWidget(self.hatary_date)
         row.addStretch()
         hb_layout.addLayout(row)
-        hb_layout.addWidget(self.rb_indef)
-        hb_layout.addWidget(self.rb_until_mod)
+        choices = QHBoxLayout()
+        choices.addWidget(self.rb_indef)
+        choices.addWidget(self.rb_until_mod)
+        hb_layout.addLayout(choices)
         form_right.addRow(hataly_box)
 
         # Felülvizsgálat - typed entries and compact controls (simple controls removed)
@@ -368,7 +374,7 @@ class EngedelyDialog(QDialog):
         # typed entries list
         fv_entries_row = QHBoxLayout()
         self.fv_entries_list = QListWidget()
-        self.fv_entries_list.setFixedHeight(180)
+        self.fv_entries_list.setFixedHeight(90)
         fv_buttons_v = QVBoxLayout()
         self.btn_fv_add = QPushButton("+ Hozzáadás")
         self.btn_fv_edit = QPushButton("✎ Szerkesztés")
@@ -385,6 +391,7 @@ class EngedelyDialog(QDialog):
         fv_v.addLayout(fv_entries_row)
 
         self.next_review_lbl = QLabel("")
+        self.next_review_lbl.setWordWrap(True)
         self.next_review_lbl.setStyleSheet("font-weight: bold; color: red;")
         fv_v.addWidget(self.next_review_lbl)
         self.hatary_date.dateChanged.connect(self._on_hataly_changed)
@@ -405,6 +412,7 @@ class EngedelyDialog(QDialog):
         general_scroll.setWidgetResizable(True)
         general_scroll.setWidget(gen_w)
         tabs.addTab(general_scroll, "Általános")
+        tabs.addTab(details, "Módosító határozatok")
 
         # ---------- Hulladék (simple rows) ----------
         waste_w = QWidget()
@@ -439,26 +447,30 @@ class EngedelyDialog(QDialog):
 
         # ---------- Csatolmányok ----------
         att_w = QGroupBox("Csatolmányok – automatikus adatfelismerés")
-        att_layout = QHBoxLayout(att_w)
-        left_att_col = QVBoxLayout()
-        left_att_col.addWidget(QLabel("Csatolt fájlok:"))
+        att_layout = QVBoxLayout(att_w)
         self.attach_list = QListWidget()
-        self.attach_list.setMaximumHeight(90)
-        left_att_col.addWidget(self.attach_list)
-        att_layout.addLayout(left_att_col, 1)
+        self.attach_list.setFixedHeight(54)
 
-        right_att_col = QVBoxLayout()
+        right_att_col = QHBoxLayout()
         self.attach_add = QPushButton("Fájl tallózása…")
         self.attach_del = QPushButton("- Fájl törlése")
         self.attach_view = QPushButton("👁 Megtekintés")
         right_att_col.addWidget(self.attach_add)
         right_att_col.addWidget(self.attach_del)
         right_att_col.addWidget(self.attach_view)
+        self.ocr_settings_btn = QPushButton("OCR-szabályok…")
+        self.ocr_retry_btn = QPushButton("OCR újra")
+        right_att_col.addWidget(self.ocr_settings_btn)
+        right_att_col.addWidget(self.ocr_retry_btn)
         right_att_col.addStretch()
         att_layout.addLayout(right_att_col)
+        att_layout.addWidget(self.attach_list)
         self.attach_add.clicked.connect(self.add_attachment)
         self.attach_del.clicked.connect(self.remove_attachment)
         self.attach_view.clicked.connect(self.view_attachment)
+        self.attach_list.itemDoubleClicked.connect(lambda _item: self.view_attachment())
+        self.ocr_settings_btn.clicked.connect(self.open_ocr_settings)
+        self.ocr_retry_btn.clicked.connect(self.retry_ocr)
         gen_layout.insertWidget(0, att_w)
         self.ocr_status = QLabel("PDF vagy kép tallózásakor a tárgy és a hatály automatikusan kitöltődik.")
         self.ocr_status.setWordWrap(True)
@@ -571,7 +583,6 @@ class EngedelyDialog(QDialog):
             if idx >= 0:
                 self.telephely_combo.setCurrentIndex(idx)
             self.targy.setText(e.get("engedely_nev") or "")
-            self.targy.setFixedHeight(50)
             if e.get("kategoria"):
                 self.kategoria.setCurrentText(e.get("kategoria"))
             self.kiado.setText(e.get("kiado_hatosag") or "")
@@ -859,14 +870,36 @@ class EngedelyDialog(QDialog):
         self._validity_revision += 1
 
     def _start_ocr(self, paths: List[Path]) -> None:
+        if self._ocr_worker is not None:
+            return
+        try:
+            rules = load_ocr_rules()
+        except ValueError as exc:
+            logger.warning("%s", exc)
+            self.ocr_status.setText(str(exc))
+            QMessageBox.warning(self, "OCR", str(exc))
+            return
         self._ocr_revisions = (self._subject_revision, self._validity_revision)
         self.ocr_status.setText("Dokumentumok feldolgozása… Az adatmezők közben szerkeszthetők.")
-        for button in (self.attach_add, self.attach_del, self.save_btn):
+        for button in (self.attach_add, self.attach_del, self.save_btn, self.ocr_retry_btn, self.ocr_settings_btn):
             button.setEnabled(False)
-        self._ocr_worker = OcrWorker(paths, self)
+        self._ocr_worker = OcrWorker(paths, self, rules)
         self._ocr_worker.result_ready.connect(self._apply_ocr)
         self._ocr_worker.finished.connect(self._ocr_finished)
         self._ocr_worker.start()
+
+    def open_ocr_settings(self) -> None:
+        OcrSettingsDialog(self).exec()
+
+    def retry_ocr(self) -> None:
+        selected = self.attach_list.selectedItems()
+        items = selected or [self.attach_list.item(i) for i in range(self.attach_list.count())]
+        paths = [item.data(Qt.UserRole) for item in items]
+        paths = [path for path in paths if path.suffix.lower() in SUPPORTED_EXTENSIONS]
+        if not paths:
+            QMessageBox.information(self, "OCR", "Válasszon egy csatolt PDF-et vagy képet.")
+            return
+        self._start_ocr(paths)
 
     def _apply_ocr(self, fields: DocumentFields, errors: List[str]) -> None:
         if self._pending_close is not None:
@@ -903,9 +936,9 @@ class EngedelyDialog(QDialog):
         else:
             messages.insert(0, "Nem történt automatikus kitöltés; a mezők kézzel megadhatók.")
         if not fields.subject:
-            messages.append("Nem található egyértelmű „Tárgy:” érték.")
+            messages.append("Nem található egyértelmű tárgy a beállított szabályokkal.")
         if not fields.validity:
-            messages.append("Nem található egyértelmű „Hatályos:” vagy „Érvényes:” érték.")
+            messages.append("Nem található egyértelmű érvényesség a beállított szabályokkal.")
         if errors:
             messages.append("Egyes dokumentumok felismerése sikertelen.")
             QMessageBox.warning(self, "OCR", "\n\n".join(errors))
@@ -916,7 +949,7 @@ class EngedelyDialog(QDialog):
         self._ocr_worker = None
         if worker:
             worker.deleteLater()
-        for button in (self.attach_add, self.attach_del, self.save_btn):
+        for button in (self.attach_add, self.attach_del, self.save_btn, self.ocr_retry_btn, self.ocr_settings_btn):
             button.setEnabled(True)
         if self._pending_close is not None:
             result = self._pending_close
@@ -985,7 +1018,10 @@ class EngedelyDialog(QDialog):
 
     def view_attachment(self) -> None:
         sel = self.attach_list.currentItem()
+        if not sel and self.attach_list.count() == 1:
+            sel = self.attach_list.item(0)
         if not sel:
+            QMessageBox.information(self, "Csatolmányok", "Válasszon egy fájlt a listából.")
             return
         fpath = sel.data(Qt.UserRole)
         if not fpath.exists():
@@ -1007,22 +1043,20 @@ class EngedelyDialog(QDialog):
                 else:
                     lbl_img = QLabel()
                     lbl_img.setAlignment(Qt.AlignCenter)
-                    lbl_img.setPixmap(pix.scaled(dlg.size() * 0.9, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    lbl_img.setPixmap(pix.scaled(
+                        int(dlg.width() * 0.9), int(dlg.height() * 0.9),
+                        Qt.KeepAspectRatio, Qt.SmoothTransformation,
+                    ))
                     l.addWidget(lbl_img)
                 dlg.exec()
             except Exception:
+                logger.exception("Image preview failed: %s", fpath)
                 QMessageBox.warning(self, "Hiba", "Nem sikerült megjeleníteni a képet.")
         else:
             try:
-                import sys
-                if sys.platform.startswith("win"):
-                    import os
-                    os.startfile(str(fpath))
-                elif sys.platform.startswith("darwin"):
-                    subprocess.Popen(["open", str(fpath)])
-                else:
-                    subprocess.Popen(["xdg-open", str(fpath)])
-            except Exception as e:
+                open_local_path(fpath)
+            except OSError as e:
+                logger.exception("Opening attachment failed: %s", fpath)
                 QMessageBox.warning(self, "Hiba", f"Nem sikerült megnyitni: {e}")
 
     # ---------------- collect data ----------------

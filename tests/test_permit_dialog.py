@@ -9,7 +9,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDate, Qt
-from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QTabWidget
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QTabWidget, QScrollArea
 
 from core.document_ocr import DocumentFields
 from gui.engedely_dialog import EngedelyDialog
@@ -45,6 +45,34 @@ class PermitDialogTests(unittest.TestCase):
 
     def test_dialog_fits_smaller_screen(self):
         self.assertLessEqual(self.dialog.minimumSizeHint().height(), 720)
+
+    def test_general_form_needs_no_scrolling_at_laptop_size(self):
+        self.dialog.resize(1024, 640)
+        self.dialog.show()
+        self.app.processEvents()
+        scroll = self.dialog.findChild(QScrollArea)
+        self.assertEqual(scroll.verticalScrollBar().maximum(), 0)
+        self.assertEqual(scroll.horizontalScrollBar().maximum(), 0)
+        self.assertLessEqual(self.dialog.width(), 1024)
+        self.assertLessEqual(self.dialog.height(), 640)
+        for widget in (self.dialog.attach_add, self.dialog.targy, self.dialog.hatary_date, self.dialog.save_btn):
+            self.assertTrue(widget.isVisible())
+        self.dialog.hide()
+
+    def test_retry_uses_current_rules_for_existing_attachment(self):
+        from core.document_ocr import ExtractionRule, OcrRules
+        self.dialog._staging_dir.mkdir(parents=True)
+        path = self.dialog._staging_dir / "existing.pdf"
+        path.write_bytes(b"fixture")
+        self.dialog.load_attachments()
+        rules = OcrRules(subject=ExtractionRule("Kezdet", "Vége"))
+        with patch("gui.engedely_dialog.load_ocr_rules", return_value=rules):
+            with patch("gui.ocr_worker.read_document", return_value=DocumentFields(subject="Új")) as reader:
+                self.dialog.retry_ocr()
+                self.wait_for_worker()
+        self.assertEqual(reader.call_args.args[0], path)
+        self.assertEqual(reader.call_args.args[2], rules)
+        self.assertEqual(self.dialog.targy.text(), "Új")
 
     def test_legacy_review_notes_are_preserved(self):
         dialog = EngedelyDialog(

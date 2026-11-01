@@ -307,13 +307,13 @@ class Database:
     def get_changes(self, since: Optional[str]) -> List[Dict[str, Any]]:
         if not since:
             return self.get_all_data().get("engedelyek", [])
-        try:
-            with self.get_connection() as conn:
-                cur = conn.execute("SELECT * FROM engedelyek WHERE last_modified > ? AND (deleted IS NULL OR deleted=0)", (since,))
-                return [dict(row) for row in cur.fetchall()]
-        except Exception as e:
-            logger.debug("get_changes hibára futott: %s", e)
-            return []
+        with self.get_connection() as conn:
+            # Include tombstones and compare both legacy naive-UTC and offset timestamps.
+            cur = conn.execute(
+                "SELECT * FROM engedelyek WHERE julianday(last_modified) >= julianday(?)",
+                (since,),
+            )
+            return [dict(row) for row in cur.fetchall()]
 
     # ---------------- BACKUP / RESTORE ----------------
     def _backup_lock_path(self) -> Path:
