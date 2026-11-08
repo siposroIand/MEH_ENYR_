@@ -52,17 +52,33 @@ automatikusan elindul a háttérben a szövegfelismerés:
 
 - A `Tárgy:` utáni szöveg a tárgymezőbe kerül; több sor esetén a következő
   mezőig vagy üres sorig tartó szöveget használja.
-- A `Hatályos:` vagy `Érvényes:` utáni dátum a lejáratot tölti ki.
-  Példák: `2030.12.31.`, `2030-12-31`, `2030/12/31`, `2030. december 31.`
+- A `Hatályos:`, `Érvényes:`, `Lejárat:`, `Hatálya:` és
+  `Érvényességi idő:` mezőkből, illetve az engedély/határozat hatályáról szóló
+  mondatokból keresi a lejáratot. Például `2026.november 19.` → `2026.11.19.`,
+  illetve `Az engedély 2026. november 19. napjáig érvényes.`
+  A numerikus `2030.12.31.`, `2030-12-31` és `2030/12/31` alak is támogatott.
+- A `kiadástól 5 évig`, `kiadásától számított öt év` és hasonló szövegekhez
+  megkeresi a dokumentum keltezését (`Kelt:`, `Keltezés:`, kiadási dátum vagy
+  `Budapest, 2021. november 19.` jellegű dátumsor), és naptári éveket ad hozzá.
+  A keltezés másik oldalon is lehet, de másik csatolmányból nem veszi át.
+  Február 29. nem szökőévre számítva február 28. lesz.
+- A `Határozatszám`, `Határozat száma`, `Ügyiratszám`, `Iktatószám`,
+  `Ügyszám`, `Engedély száma` és `Szám` fejléceket is felismeri.
+  Nem követel egyetlen számalakot: betűs előtagok, szóközök, pontok,
+  kötőjelek és perjelek is megmaradnak, például `PE/KTFO/1234-5/2026`.
 - Egyértelmű dátumtartománynál a záródátumot használja:
   `2025.01.01. – 2030.12.31.` vagy
   `2025. január 1-től 2030. december 31-ig`.
 - A „határozatlan” és a „visszavonásig / változtatásig / módosításig”
-  szövegeket is kezeli. Kezdődátumból vagy relatív időtartamból nem talál ki
-  lejáratot.
+  szövegeket is kezeli. Kezdődátumból önmagában nem talál ki lejáratot.
+  Hiányzó, hibás vagy többféle keltezésnél nem számol relatív lejáratot.
+  Jogerőre emelkedést, kézbesítést vagy véglegessé válást nem helyettesít
+  automatikusan a keltezéssel.
 
 Több fájl vagy oldal eltérő találatai esetén az érintett mezőt nem írja felül,
 hanem figyelmeztet. A feldolgozás közben kézzel módosított mezők megmaradnak.
+Ez a határozatszámra is érvényes. A felismerés helyi, szabályalapú segítség,
+nem minden határozatsablonra garantált értelmezés.
 **Mentés előtt ellenőrizze az OCR-rel felismert adatokat.** Hiányzó OCR-motor,
 hibás dokumentum vagy időtúllépés esetén a csatolmány megmarad és az adatok
 kézzel is megadhatók. Az OCR időkorlátja képenként 45 másodperc; megszakításkor
@@ -95,7 +111,73 @@ nem kerülnek a közös adatbázisba. Az **OCR újra** gomb a kijelölt csatolm�
 kijelölés nélkül az adatlap összes támogatott csatolmányát újra feldolgozza
 az aktuális szabályokkal, újabb fájlmásolat készítése nélkül.
 
-### Fájlok megnyitása
+### Engedélytípusok és hatóságok
+
+Az **Engedélytípus** mező szerkeszthető: az alaplista mellett saját kategória
+is megadható. A mentett kategóriák a későbbi adatfelvitelnél, szűrésnél és
+csoportos exportálásnál is elérhetők. Excel-exportnál a munkalapnevek
+érvényesek és egyediek maradnak hosszú vagy perjeles kategóriáknál is;
+az adatcellákban az eredeti név szerepel. A kiadó hatóság mező a mentett
+hatóságnevekből kínál kiegészítést. Az új nevek az engedéllyel együtt,
+egyetlen tranzakcióban kerülnek a törzstáblákba; hibás mentés nem hagy
+félkész törzsadatot.
+
+## Adatbázis és átállás a régi verzióról
+
+Az új SQLite-adatbázis pontosan négy táblát tartalmaz:
+
+| Tábla | Tartalom |
+|---|---|
+| `telephelyek` | Telephelyek, KTJ és cím |
+| `engedelyek` | Engedélyadatok, hatály, felülvizsgálatok, hulladékadatok |
+| `hatosagok` | Egyedi hatóságnevek |
+| `engedelytipusok` | Egyedi engedélytípusok/kategóriák |
+
+Az engedélyek idegen kulccsal hivatkoznak a telephelyre, a hatóságra és az
+engedélytípusra. A kapcsolatok ellenőrzése minden kapcsolaton aktív.
+A kapcsolatok és az időbélyeg szerinti részleges frissítés indexeltek;
+az alkalmazás indításkor nem végez teljes táblás adatjavítást.
+Foglalt adatbázisnál a SQLite zárolásvárakozási időkorlátja 2 másodperc, az
+újrapróbálható olvasások legfeljebb három kísérletet tesznek.
+A dátumok belül ISO (`YYYY-MM-DD`) alakban maradnak; az adatlap a
+keltezést és lejáratot `YYYY.MM.DD.` alakban mutatja.
+
+**Nincs automatikus migráció.** Régi adatbázisnál az alkalmazás érthető
+hibával leáll, nem módosítja a fájlt. Az egyszeri konvertálást a projekt
+gyökerében található **`convert_database.py`** végzi. A projektből futtatható,
+csak a Python standard könyvtárát és a projekt közös sémadefinícióját
+használja; a GUI/OCR csomagokat nem kell hozzá telepíteni.
+
+1. Zárja be az alkalmazás összes példányát. Készítsen biztonsági mentést
+   az adatbázisról és a csatolmánykönyvtárról.
+2. A projekt könyvtárából futtassa, két különböző fájlnevet megadva:
+
+   ```sh
+   python convert_database.py "regi.db" "uj.db"
+   ```
+
+3. Az új fájl ellenőrzése után állítsa be a `config/app_config.py`
+   `DB_FILENAME` értékét az új fájlnévre, és helyezze a fájlt az adatkönyvtár
+   `db` almappájába. A régi fájlt őrizze meg. A csatolmányok helye változatlan.
+
+A konvertáló új fájlt készít, meglévő célt nem ír felül. A mentett WAL-adatokat
+is beolvassa, megőrzi az engedély- és telephelyazonosítókat, az archivált és
+törölt engedélyeket, valamint a meglévő felülvizsgálatokat. A régi hiányzó
+hatály- és felülvizsgálati mezőket egyszer tölti fel. A hatóság- és
+kategórianevekről levágja a szélső szóközöket, az azonos neveket összevonja.
+Aktív engedély hiányzó telephelye, ismeretlen oszlop vagy sérült adatbázis
+esetén leáll, kész célfájl nélkül. A korábban törölt engedély már nem létező
+telephelyhivatkozását figyelmeztetéssel kiüríti, az engedélyt megtartja.
+
+Az új fájlt csak sikeres integritás-, idegenkulcs- és rekordszám-ellenőrzés
+után teszi elérhetővé. Ehhez a célkönyvtár fájlrendszerének hard linket kell
+támogatnia (például helyi NTFS vagy ext4); hálózati megosztás helyett
+érdemes helyi célfájlba konvertálni, és utána átmásolni a kész adatbázist.
+A régi `db_events` eseménynapló a régi fájlban marad; az új alkalmazás
+eseményei a Python-naplóba kerülnek. Régi sémájú biztonsági mentést is előbb
+konvertálni kell, közvetlenül nem állítható vissza az új alkalmazásban.
+
+## Fájlok megnyitása
 
 A főtábla **Engedély(ek)** oszlopán dupla kattintással, illetve a jobb gombos
 **Csatolmányok megnyitása** menüponttal nyithatók meg a fájlok.

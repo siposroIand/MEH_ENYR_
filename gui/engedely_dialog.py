@@ -188,6 +188,7 @@ class EngedelyDialog(QDialog):
         telephelyek: Optional[List[dict]] = None,
         hatosag_lista: Optional[List[str]] = None,
         attachments_base: Optional[str] = None,
+        kategoriak: Optional[List[str]] = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Engedély adatlap")
@@ -204,6 +205,8 @@ class EngedelyDialog(QDialog):
         self._pending_close: Optional[int] = None
         self._subject_revision = 0
         self._validity_revision = 0
+        self._number_revision = 0
+        self._categories = kategoriak or get_ordered_categories()
 
         # internal list of felulvizsgalat entries: list of typed dicts
         self.felulvizsgalatok: List[Dict[str, Any]] = []
@@ -212,6 +215,7 @@ class EngedelyDialog(QDialog):
         self._populate_from_entity()
         self.load_attachments()
         self.targy.textChanged.connect(self._subject_changed)
+        self.hatarozatszam.textChanged.connect(self._number_changed)
         self.hatary_date.dateChanged.connect(self._validity_changed)
         for radio in (self.rb_fixed, self.rb_indef, self.rb_until_mod):
             radio.toggled.connect(self._validity_changed)
@@ -246,8 +250,9 @@ class EngedelyDialog(QDialog):
         for t in telephelyek:
             self.telephely_combo.addItem(t.get("nev") or "", t.get("id"))
 
-        categories = get_ordered_categories()
+        categories = self._categories
         self.kategoria = QComboBox()
+        self.kategoria.setEditable(True)
         self.kategoria.addItems(categories)
         self.kategoria.currentTextChanged.connect(self.on_category_changed)
 
@@ -257,7 +262,7 @@ class EngedelyDialog(QDialog):
         self.targy.setMinimumWidth(240)
 
         self.hatarozatszam = QLineEdit()
-        self.hatarozatszam.setPlaceholderText("Határozatszám (kötelező)")
+        self.hatarozatszam.setPlaceholderText("Határozat-, ügyirat- vagy engedélyszám")
         self.hatarozatszam.setMaxLength(200)
         self.hatarozatszam.setMinimumWidth(240)
 
@@ -338,6 +343,7 @@ class EngedelyDialog(QDialog):
 
         self.keltezes_cb = QCheckBox("Engedély keltezése")
         self.keltezes_date = QDateEdit(QDate.currentDate())
+        self.keltezes_date.setDisplayFormat("yyyy.MM.dd.")
         self.keltezes_date.setCalendarPopup(True)
         self.keltezes_date.setEnabled(False)
         self.keltezes_cb.toggled.connect(self.keltezes_date.setEnabled)
@@ -350,6 +356,7 @@ class EngedelyDialog(QDialog):
         self.rb_until_mod = QRadioButton("Változtatásig")
         self.rb_fixed.setChecked(True)
         self.hatary_date = QDateEdit(QDate.currentDate().addYears(5))
+        self.hatary_date.setDisplayFormat("yyyy.MM.dd.")
         self.hatary_date.setCalendarPopup(True)
         self.hatary_date.setEnabled(True)
         self.rb_fixed.toggled.connect(self._on_hataly_changed)
@@ -472,7 +479,7 @@ class EngedelyDialog(QDialog):
         self.ocr_settings_btn.clicked.connect(self.open_ocr_settings)
         self.ocr_retry_btn.clicked.connect(self.retry_ocr)
         gen_layout.insertWidget(0, att_w)
-        self.ocr_status = QLabel("PDF vagy kép tallózásakor a tárgy és a hatály automatikusan kitöltődik.")
+        self.ocr_status = QLabel("PDF vagy kép tallózásakor a tárgy, a határozatszám és a hatály felismerése elindul.")
         self.ocr_status.setWordWrap(True)
         gen_layout.insertWidget(1, self.ocr_status)
 
@@ -869,6 +876,9 @@ class EngedelyDialog(QDialog):
     def _validity_changed(self, *_args) -> None:
         self._validity_revision += 1
 
+    def _number_changed(self, *_args) -> None:
+        self._number_revision += 1
+
     def _start_ocr(self, paths: List[Path]) -> None:
         if self._ocr_worker is not None:
             return
@@ -879,7 +889,7 @@ class EngedelyDialog(QDialog):
             self.ocr_status.setText(str(exc))
             QMessageBox.warning(self, "OCR", str(exc))
             return
-        self._ocr_revisions = (self._subject_revision, self._validity_revision)
+        self._ocr_revisions = (self._subject_revision, self._validity_revision, self._number_revision)
         self.ocr_status.setText("Dokumentumok feldolgozása… Az adatmezők közben szerkeszthetők.")
         for button in (self.attach_add, self.attach_del, self.save_btn, self.ocr_retry_btn, self.ocr_settings_btn):
             button.setEnabled(False)
@@ -906,6 +916,14 @@ class EngedelyDialog(QDialog):
             return
         messages = list(fields.warnings)
         updated = []
+        if fields.decision_number:
+            if self._number_revision != self._ocr_revisions[2]:
+                messages.append("A kézzel módosított határozatszámot nem írtuk felül.")
+            elif len(fields.decision_number) > self.hatarozatszam.maxLength():
+                messages.append("A felismert határozatszám túl hosszú; adja meg kézzel.")
+            else:
+                self.hatarozatszam.setText(fields.decision_number)
+                updated.append("határozatszám")
         if fields.subject:
             if self._subject_revision != self._ocr_revisions[0]:
                 messages.append("A kézzel módosított tárgyat nem írtuk felül.")
@@ -1064,7 +1082,7 @@ class EngedelyDialog(QDialog):
         data = {
             "telephely_id": self.telephely_combo.currentData(),
             "engedely_nev": self.targy.text().strip() or None,
-            "kategoria": self.kategoria.currentText(),
+            "kategoria": self.kategoria.currentText().strip(),
             "kiado_hatosag": self.kiado.text().strip() or None,
             "hatarozatszam": self.hatarozatszam.text().strip(),
             "modosito_hat": None,
@@ -1134,6 +1152,9 @@ class EngedelyDialog(QDialog):
             return
         if not self.hatarozatszam.text().strip():
             QMessageBox.warning(self, "Hiányzó adat", "A határozatszám megadása kötelező.")
+            return
+        if not self.kategoria.currentText().strip():
+            QMessageBox.warning(self, "Hiányzó adat", "Az engedélytípus megadása kötelező.")
             return
         self._sanitize_review_entries()
         self.accept()

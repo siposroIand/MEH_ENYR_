@@ -11,6 +11,84 @@ from core.document_ocr import (
 
 
 class FieldExtractionTests(unittest.TestCase):
+    def test_hungarian_expiry_spellings_and_prose(self):
+        for text in (
+            "Lejárat: 2026.november 19.",
+            "Érvényességi idő: 2026. november 19.",
+            "Az engedély 2026. november 19. napjáig érvényes.",
+            "Az engedély hatálya 2026.november 19-ig tart.",
+            "A határozat érvényességi ideje 2026. november 19.",
+            "Az engedély\n2026.november 19-ig\nhatályos.",
+        ):
+            with self.subTest(text=text):
+                fields = extract_fields(text)
+                self.assertEqual(fields.expiry, date(2026, 11, 19))
+                self.assertEqual(fields.warnings, ())
+
+    def test_relative_expiry_uses_issue_date(self):
+        for duration in (
+            "kiadástól 5 évig", "kiadásától számított öt év",
+            "kiadás napjától számított 5 (öt) évig",
+            "keltezésétől számított 5 évre",
+        ):
+            for dateline in ("Kelt: Budapest, 2021.november 19.", "Keltezés: 2021-11-19", "Budapest, 2021. november 19."):
+                with self.subTest(duration=duration, dateline=dateline):
+                    fields = extract_fields(f"Érvényes: a {duration}\n\n{dateline}")
+                    self.assertEqual(fields.expiry, date(2026, 11, 19))
+        fields = extract_fields("Kelt: 2021.11.19.\nkiadástól 5 évig")
+        self.assertEqual(fields.expiry, date(2026, 11, 19))
+
+    def test_relative_expiry_across_pages_and_leap_year(self):
+        for text, expected in (
+            ("Hatályos: kiadástól 5 évig\fKelt: 2020.02.29.", date(2025, 2, 28)),
+            ("Hatályos: kiadástól 4 évig\fKelt: 2020.02.29.", date(2024, 2, 29)),
+        ):
+            self.assertEqual(extract_fields(text).expiry, expected)
+
+    def test_empty_default_field_does_not_consume_next_page(self):
+        fields = extract_fields("Tárgy:\fMásik oldal szövege\nÉrvényes: 2030.01.01.")
+        self.assertIsNone(fields.subject)
+        self.assertEqual(fields.expiry, date(2030, 1, 1))
+        self.assertIsNone(extract_fields("Érvényes:\f2030.01.01.").expiry)
+        self.assertIsNone(extract_fields("Határozatszám:\f2030.01.01.").decision_number)
+
+    def test_relative_missing_conflicting_or_wrong_anchor_not_guessed(self):
+        for text in (
+            "Érvényes: a kiadástól számított öt év",
+            "Érvényes: kiadástól 5 évig\nKelt: 2021.01.01.\nKelt: 2022.01.01.",
+            "Érvényes: kiadástól 5 évig\nKelt: 2021.02.30.",
+            "Érvényes: jogerőre emelkedéstől számított 5 év\nKelt: 2021.01.01.",
+            "Érvényes: kézhezvételtől számított 5 év\nKelt: 2021.01.01.",
+            "Érvényes: 2021.01.01. napjától 5 évig",
+            "Érvényes: kiadástól 5 évig vagy kiadástól 10 évig\nKelt: 2021.01.01.",
+            "Érvényes: kiadástól 5 évig vagy 10 évig\nKelt: 2021.01.01.",
+            "Érvényes: határozatlan vagy kiadástól 5 évig\nKelt: 2021.01.01.",
+            "Érvényes: kiadástól 5 évig, 2030.01.01.\nKelt: 2021.01.01.",
+        ):
+            with self.subTest(text=text):
+                fields = extract_fields(text)
+                self.assertIsNone(fields.expiry)
+                self.assertIsNone(fields.validity)
+                self.assertTrue(fields.warnings)
+
+    def test_flexible_decision_number_headers(self):
+        for label in ("Határozatszám", "Határozat száma", "Ügyiratszám", "Iktatószám", "Iktató szám", "Ügyszám", "Engedély száma", "Szám"):
+            for identifier in ("PE/KTFO/1234-5/2026.", "123-4/2026", "ABC 123 / 2026", "12345"):
+                with self.subTest(label=label, identifier=identifier):
+                    fields = extract_fields(f"Straße\n{label}: {identifier}\nTárgy: Engedély")
+                    self.assertEqual(fields.decision_number, identifier)
+        self.assertEqual(extract_fields("Ügyiratszám:\nPE/123/2026").decision_number, "PE/123/2026")
+        self.assertEqual(extract_fields("Ügyiratszám PE/123/2026").decision_number, "PE/123/2026")
+
+    def test_ambiguous_numbers_and_validity_survive_file_merge(self):
+        first = extract_fields("Határozatszám: 1/2026\nÜgyiratszám: 2/2026\nÉrvényes: 2030.01.01.\nHatályos: 2031.01.01.")
+        second = extract_fields("Határozatszám: 1/2026\nÉrvényes: 2030.01.01.")
+        merged = merge_fields([first, second])
+        self.assertIsNone(merged.validity)
+        self.assertIsNone(merged.decision_number)
+        self.assertTrue(merged.warnings)
+        self.assertIsNone(extract_fields("Adószám: 12345678\n2026.11.19.").decision_number)
+
     def test_subject_and_numeric_dates(self):
         for label in ("Hatályos", "Érvényes", "HATALYOS", "ervenyes"):
             for value in ("2031. 02. 28.", "2031-02-28", "2031/02/28"):
@@ -111,6 +189,39 @@ class DocumentReadingTests(unittest.TestCase):
         self.assertEqual(fields.subject, "Hulladékgazdálkodási engedély")
         self.assertEqual(fields.expiry, date(2030, 12, 31))
 
+    def test_native_pdf_relative_expiry_uses_other_page_dateline(self):
+        import reportlab
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.pdfgen.canvas import Canvas
+        pdfmetrics.registerFont(TTFont("OCRRelative", str(Path(reportlab.__file__).parent / "fonts/Vera.ttf")))
+        path = self.root / "relative.pdf"
+        canvas = Canvas(str(path))
+        canvas.setFont("OCRRelative", 16)
+        canvas.drawString(30, 780, "Ügyiratszám: PE/1234-5/2021")
+        canvas.drawString(30, 750, "Hatályos: a kiadástól számított öt évig")
+        canvas.showPage()
+        canvas.setFont("OCRRelative", 16)
+        canvas.drawString(30, 780, "Kelt: Budapest, 2021. november 19.")
+        canvas.save()
+        with patch("pytesseract.image_to_string", side_effect=AssertionError("Native PDF needs no OCR")):
+            fields = read_document(path)
+        self.assertEqual(fields.expiry, date(2026, 11, 19))
+        self.assertEqual(fields.decision_number, "PE/1234-5/2021")
+
+    def test_multi_frame_image_keeps_shared_issue_context(self):
+        image = self.make_image()
+        self.addCleanup(image.close)
+        path = self.root / "two-pages.tiff"
+        image.save(path, save_all=True, append_images=[image])
+        with patch("pytesseract.image_to_string", side_effect=[
+            "Érvényes: kiadástól 5 évig\nHatározatszám: X/2021",
+            "Kelt: 2021.november 19.",
+        ]):
+            fields = read_document(path)
+        self.assertEqual(fields.expiry, date(2026, 11, 19))
+        self.assertEqual(fields.decision_number, "X/2021")
+
     def test_real_ocr_image_and_scanned_pdf(self):
         image = self.make_image()
         self.addCleanup(image.close)
@@ -157,6 +268,19 @@ class DocumentReadingTests(unittest.TestCase):
 
 
 class CustomRuleTests(unittest.TestCase):
+    def test_relative_rule_retains_document_issue_context(self):
+        fields = extract_fields(
+            "Határozatszám: X/12/2021\nLejárat kiadástól 5 évig Vége\fKelt: 2021.11.19.",
+            OcrRules(validity=ExtractionRule("Lejárat", "Vége")),
+        )
+        self.assertEqual(fields.expiry, date(2026, 11, 19))
+        self.assertEqual(fields.decision_number, "X/12/2021")
+
+    def test_custom_end_cannot_cross_page(self):
+        fields = extract_fields("Lejárat 2030.12.31.\fVége", OcrRules(validity=ExtractionRule("Lejárat", "Vége")))
+        self.assertIsNone(fields.expiry)
+        self.assertTrue(fields.warnings)
+
     def test_after_marker_and_between_markers(self):
         rules = OcrRules(ExtractionRule("Tárgy"), ExtractionRule("Érvényes", "lezárás"))
         fields = extract_fields("TÁRGY: Hulladék engedély\n\nÉrvényes 2030.12.31. lezárás", rules)

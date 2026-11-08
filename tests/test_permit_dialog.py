@@ -115,6 +115,25 @@ class PermitDialogTests(unittest.TestCase):
         self.assertEqual(self.dialog.targy.text(), "")
         self.assertIn("túl hosszú", self.dialog.ocr_status.text())
 
+    def test_decision_number_ocr_and_manual_edit_protection(self):
+        self.dialog._ocr_revisions = (
+            self.dialog._subject_revision, self.dialog._validity_revision, self.dialog._number_revision,
+        )
+        self.dialog._apply_ocr(DocumentFields(decision_number="PE/KTFO/123-4/2026"), [])
+        self.assertEqual(self.dialog.get_data()["hatarozatszam"], "PE/KTFO/123-4/2026")
+        self.dialog._ocr_revisions = (
+            self.dialog._subject_revision, self.dialog._validity_revision, self.dialog._number_revision,
+        )
+        self.dialog.hatarozatszam.setText("Kézi/2026")
+        self.dialog._apply_ocr(DocumentFields(decision_number="OCR/2026"), [])
+        self.assertEqual(self.dialog.hatarozatszam.text(), "Kézi/2026")
+        self.assertIn("kézzel módosított határozatszámot", self.dialog.ocr_status.text())
+
+    def test_hungarian_date_display_keeps_iso_storage(self):
+        self.dialog.hatary_date.setDate(QDate(2026, 11, 19))
+        self.assertEqual(self.dialog.hatary_date.text(), "2026.11.19.")
+        self.assertEqual(self.dialog.get_data()["lejarat"], "2026-11-19")
+
     def test_failed_ocr_keeps_attachment_and_enables_manual_entry(self):
         from core.document_ocr import DocumentReadError
         source = self.root / "bad.pdf"

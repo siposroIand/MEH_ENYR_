@@ -26,6 +26,7 @@ class MainWindowRegressionTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.db = Mock()
         self.db.get_all_data.return_value = {"telephelyek": [], "engedelyek": []}
+        self.db.get_catalogs.return_value = {"hatosagok": [], "engedelytipusok": []}
         self.window = MainWindow(self.db, {"attachments": self.root})
         for timer in self.window.findChildren(QTimer):
             timer.stop()

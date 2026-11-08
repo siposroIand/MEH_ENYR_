@@ -38,6 +38,20 @@ def sanitize_filename(name: str, max_length: int = 180) -> str:
     return safe or f"file_{int(datetime.utcnow().timestamp())}"
 
 
+def unique_sheet_name(name: str, used_names: set[str]) -> str:
+    """Reserve an Excel-compatible sheet name without case/truncation collisions."""
+    base = re.sub(r"[\x00-\x1f\\/*?:\[\]]", "_", name).strip("'")[:31].rstrip("'") or "Sheet"
+    existing = {value.casefold() for value in used_names}
+    candidate = base
+    index = 2
+    while candidate.casefold() in existing:
+        suffix = f" ({index})"
+        candidate = base[:31 - len(suffix)] + suffix
+        index += 1
+    used_names.add(candidate)
+    return candidate
+
+
 def atomic_replace(src: Path, dst: Path) -> None:
     src = Path(src)
     dst = Path(dst)

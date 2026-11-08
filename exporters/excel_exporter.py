@@ -24,6 +24,7 @@ import json
 
 from config.app_config import get_ordered_categories
 from utils.dates import compute_review_date
+from utils.fs_utils import unique_sheet_name
 
 # Full column set: mapping keys used internally -> (header text, row_key)
 ALL_COLUMNS: List[Tuple[str, str]] = [
@@ -337,12 +338,13 @@ def export_to_excel(path: str, items: List[dict], telephelyek: List[dict], optio
     # write workbook
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         all_rows = []
+        used_names = {"Összes"} if group_by in ("telephely", "kategoria") else set()
         for name in ordered_keys:
             grp = groups.get(name, [])
             # ensure consistent order of columns
             rows_out = [[row.get(col_key, "") for col_key in columns] for row in grp]
             df = pd.DataFrame(rows_out, columns=headers)
-            safe_sheet = (name[:31] or "Sheet")
+            safe_sheet = unique_sheet_name(name, used_names)
             df.to_excel(writer, sheet_name=safe_sheet, index=False)
             all_rows.extend(rows_out)
         if all_rows:

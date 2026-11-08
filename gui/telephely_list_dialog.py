@@ -1,4 +1,6 @@
 import logging
+import sqlite3
+from datetime import datetime
 from uuid import uuid4
 from typing import List
 
@@ -147,15 +149,20 @@ class TelephelyListDialog(QDialog):
                 if row and row["c"] > 0:
                     QMessageBox.warning(self, "Nem törölhető", "A telephelyhez engedélyek tartoznak — előbb törölje vagy áthelyezze azokat.")
                     return
-        except Exception:
-            # ha ellenőrzés nem sikerült, ne engedjük automatikusan törölni, kérjünk megerősítést
-            pass
+        except sqlite3.Error as exc:
+            logger.exception("Telephelyhivatkozások ellenőrzése sikertelen")
+            QMessageBox.critical(self, "Hiba", f"Nem ellenőrizhető a telephely törölhetősége: {exc}")
+            return
 
         if QMessageBox.question(self, "Törlés megerősítése", f"Tényleg törli a telephelyet?\n{t.get('nev')}") != QMessageBox.Yes:
             return
 
         try:
             with self.db.get_connection() as conn:
+                conn.execute(
+                    "UPDATE engedelyek SET telephely_id=NULL, last_modified=? WHERE telephely_id=? AND deleted=1",
+                    (datetime.utcnow().isoformat(), t["id"]),
+                )
                 conn.execute("DELETE FROM telephelyek WHERE id=?", (t["id"],))
             self._safe_log("telephely_delete")
         except Exception as e:
