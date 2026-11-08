@@ -32,7 +32,7 @@ class OcrSettingsTests(unittest.TestCase):
         self.dialog.sample.setPlainText("Kezdet próba Vége\nLejárat: 2030.12.31.")
         self.dialog.preview()
         self.assertIn("Tárgy: próba", self.dialog.preview_result.toPlainText())
-        self.assertIn("2030-12-31", self.dialog.preview_result.toPlainText())
+        self.assertIn("2030.12.31.", self.dialog.preview_result.toPlainText())
         self.dialog.save()
         self.assertEqual(self.dialog.result(), QDialog.Accepted)
         self.assertEqual(load_ocr_rules(QSettings(self.path, QSettings.IniFormat)), rules)

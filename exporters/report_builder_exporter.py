@@ -6,6 +6,7 @@ import logging
 import re
 import math
 import json
+from utils.fs_utils import unique_sheet_name
 
 logger = logging.getLogger(__name__)
 
@@ -556,12 +557,13 @@ def export_report_excel(
 
     # prepare writer
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        used_names = set()
         for gname, items in groups.items():
+            sheet_name = unique_sheet_name(_render_str(gname), used_names)
             if not items:
                 # create empty sheet with requested headers
                 cols = (columns if isinstance(columns, list) else (columns.get(gname, list(KEY_TO_HEADER.keys())) if isinstance(columns, dict) else list(KEY_TO_HEADER.keys())))
                 df = pd.DataFrame(columns=[KEY_TO_HEADER.get(k,k) for k in cols])
-                sheet_name = (_render_str(gname)[:31]) if gname else "Üres"
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
                 continue
 
@@ -580,7 +582,6 @@ def export_report_excel(
                 rows.append([_none_to_empty(r.get(k, "")) for k in effective_cols])
 
             df = pd.DataFrame(rows, columns=[KEY_TO_HEADER.get(k,k) for k in effective_cols])
-            sheet_name = (_render_str(gname)[:31]) if gname else "Sheet1"
             df.to_excel(writer, sheet_name=sheet_name, index=False)
 
             # styling: header + enable wrap_text for all data cells (so '\n' from modosito_hat shows)

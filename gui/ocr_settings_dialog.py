@@ -109,9 +109,10 @@ class OcrSettingsDialog(QDialog):
             return
         validity = {
             "indefinite": "Határozatlan", "until_modified": "Változtatásig",
-        }.get(fields.validity, str(fields.expiry) if fields.expiry else "Nincs találat")
+        }.get(fields.validity, fields.expiry.strftime("%Y.%m.%d.") if fields.expiry else "Nincs találat")
         self.preview_result.setPlainText("\n".join((
             f"Tárgy: {fields.subject or 'Nincs találat'}",
+            f"Határozatszám: {fields.decision_number or 'Nincs találat'}",
             f"Érvényesség: {validity}", *fields.warnings,
         )))
 

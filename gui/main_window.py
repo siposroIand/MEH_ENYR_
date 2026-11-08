@@ -46,6 +46,7 @@ except Exception:
     OPENPYXL_AVAILABLE = False
 
 from config.app_config import get_ordered_categories
+from core.db import lookup_id
 from PySide6.QtWidgets import QToolTip
 from PySide6.QtGui import QFont
 
@@ -191,18 +192,21 @@ class DropdownMultiSelect(QWidget):
         """
         items: list of (text, data, checked?) or (text, data)
         """
-        self.listw.clear()
-        for it in items:
-            if len(it) == 3:
-                text, data, checked = it
-            else:
-                text, data = it
-                checked = False
-            lw_item = QListWidgetItem(text)
-            lw_item.setData(Qt.UserRole, data)
-            if checked:
-                lw_item.setSelected(True)
-            self.listw.addItem(lw_item)
+        previous = self.listw.blockSignals(True)
+        try:
+            self.listw.clear()
+            for it in items:
+                if len(it) == 3:
+                    text, data, checked = it
+                else:
+                    text, data = it
+                    checked = False
+                lw_item = QListWidgetItem(text)
+                lw_item.setData(Qt.UserRole, data)
+                self.listw.addItem(lw_item)
+                lw_item.setSelected(checked)
+        finally:
+            self.listw.blockSignals(previous)
         self._update_display()
 
     def checked_texts(self) -> List[str]:
@@ -825,6 +829,7 @@ class MainWindow(QMainWindow):
             if incremental and self.last_sync:
                 telephelyek = self.db.get_telephelyek()
                 changes = self.db.get_changes(self.last_sync)
+                catalogs = self.db.get_catalogs()
                 if not self.data.get("engedelyek"):
                     self.data = self.db.get_all_data()
                 else:
@@ -836,6 +841,7 @@ class MainWindow(QMainWindow):
                         elif ch.get("id"):
                             cur_map[ch["id"]] = ch
                     self.data["engedelyek"] = list(cur_map.values())
+                    self.data.update(catalogs)
             else:
                 self.data = self.db.get_all_data()
         except sqlite3.Error:
@@ -847,6 +853,10 @@ class MainWindow(QMainWindow):
 
         self.last_sync = sync_started
         self.statusBar().clearMessage()
+        selected_categories = self.kategoria_filter.checked_texts()
+        self.kategoria_filter.set_items([
+            (name, name, name in selected_categories) for name in self.get_category_suggestions()
+        ])
 
         def parse_dt_opt(s: Optional[str]):
             if not s:
@@ -1362,7 +1372,7 @@ class MainWindow(QMainWindow):
         if not self.data.get("telephelyek"):
             warning(self, DIALOG_ENGEDELY_TITLE, "Nincs telephely!")
             return
-        dlg = EngedelyDialog(self, engedely=None, telephelyek=self.data["telephelyek"], hatosag_lista=self.get_hatosag_suggestions(), attachments_base=str(self.ATTACHMENTS_DIR))
+        dlg = EngedelyDialog(self, engedely=None, telephelyek=self.data["telephelyek"], hatosag_lista=self.get_hatosag_suggestions(), attachments_base=str(self.ATTACHMENTS_DIR), kategoriak=self.get_category_suggestions())
         res = dlg.exec()
         if res == QDialog.Accepted:
             d = dlg.get_data()
@@ -1385,7 +1395,7 @@ class MainWindow(QMainWindow):
         if EngedelyDialog is None:
             error(self, "Engedély", "Engedély dialog nem elérhető (import hiba).")
             return
-        dlg = EngedelyDialog(self, eng, self.data.get("telephelyek", []), self.get_hatosag_suggestions(), attachments_base=str(self.ATTACHMENTS_DIR))
+        dlg = EngedelyDialog(self, eng, self.data.get("telephelyek", []), self.get_hatosag_suggestions(), attachments_base=str(self.ATTACHMENTS_DIR), kategoriak=self.get_category_suggestions())
         res = dlg.exec()
         if res == QDialog.Accepted:
             d = dlg.get_data()
@@ -1406,7 +1416,7 @@ class MainWindow(QMainWindow):
 
     def _persist_permit(self, data: Dict[str, Any], entity_id: str, now: str, updating: bool = False) -> None:
         columns = (
-            "telephely_id", "engedely_nev", "kategoria", "kiado_hatosag",
+            "telephely_id", "engedely_nev", "engedelytipus_id", "hatosag_id",
             "hatarozatszam", "modosito_hat", "letrejott", "hatarozatlan",
             "lejarat", "hataly_tipus", "felulvizsgalat_nap", "felulvizsgalat_date",
             "felulvizsgalatok", "megjegyzes", "hulladek_nv_elokez",
@@ -1415,8 +1425,10 @@ class MainWindow(QMainWindow):
         values = dict(data)
         values["felulvizsgalatok"] = json.dumps(data.get("felulvizsgalatok", []), ensure_ascii=False)
         values["last_modified"] = now
-        parameters = [values.get(column) for column in columns]
         with self.db.get_connection() as conn:
+            values["engedelytipus_id"] = lookup_id(conn, "engedelytipusok", data.get("kategoria"))
+            values["hatosag_id"] = lookup_id(conn, "hatosagok", data.get("kiado_hatosag"))
+            parameters = [values.get(column) for column in columns]
             if updating:
                 assignments = ", ".join(f"{column}=?" for column in columns)
                 cursor = conn.execute(
@@ -1537,7 +1549,7 @@ class MainWindow(QMainWindow):
             all_tp = [t.get("nev", "Ismeretlen") for t in self.data.get("telephelyek", [])]
             selected = self.select_items_popup("Telephelyek kiválasztása", all_tp)
         else:
-            selected = self.select_items_popup("Engedélytípusok kiválasztása", FIX_KATEGORIAK)
+            selected = self.select_items_popup("Engedélytípusok kiválasztása", self.get_category_suggestions())
         if not selected:
             return
 
@@ -1561,7 +1573,7 @@ class MainWindow(QMainWindow):
                 rel = [e for e in items if e.get("telephely_id") == tp.get("id")]
                 if rel: groups[name] = rel
         else:
-            for kat in FIX_KATEGORIAK:
+            for kat in self.get_category_suggestions():
                 if kat not in selected: continue
                 rel = [e for e in items if e.get("kategoria") == kat]
                 if rel: groups[kat] = rel
@@ -1661,7 +1673,17 @@ class MainWindow(QMainWindow):
             logger.debug("log_event failed", exc_info=True)
 
     def get_hatosag_suggestions(self) -> List[str]:
-        return sorted(list({e.get("kiado_hatosag", "") for e in self.data.get("engedelyek", []) if e.get("kiado_hatosag")}))
+        return sorted(
+            {e["kiado_hatosag"] for e in self.data.get("engedelyek", []) if e.get("kiado_hatosag")}
+            | {h["nev"] for h in self.data.get("hatosagok", [])}
+        )
+
+    def get_category_suggestions(self) -> List[str]:
+        existing = (
+            {e["kategoria"] for e in self.data.get("engedelyek", []) if e.get("kategoria")}
+            | {t["nev"] for t in self.data.get("engedelytipusok", [])}
+        )
+        return [*FIX_KATEGORIAK, *sorted(existing - set(FIX_KATEGORIAK))]
 
     def manual_refresh(self) -> None:
         try:

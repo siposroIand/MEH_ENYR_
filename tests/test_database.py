@@ -35,17 +35,17 @@ class DatabaseTests(unittest.TestCase):
             with sqlite3.connect(backup) as restored:
                 self.assertEqual(restored.execute("SELECT nev FROM telephelyek").fetchone()[0], "WAL data")
 
-    def test_migration_backfill_and_validity_preservation(self):
+    def test_startup_does_not_backfill_or_modify_records(self):
         with self.db.get_connection() as conn:
             conn.execute(
                 "INSERT INTO engedelyek (id, hataly_tipus, lejarat, felulvizsgalat_nap) "
                 "VALUES ('permit', 'until_modified', '2030-12-31', 30)"
             )
-        self.db.migrate_db()
+        Database(self.db.db_path, self.db.backup_dir)
         permit = self.db.get_all_data()["engedelyek"][0]
         self.assertEqual(permit["hataly_tipus"], "until_modified")
-        self.assertEqual(permit["felulvizsgalat_date"], "2030-12-01")
-        self.assertIn('"type": "date"', permit["felulvizsgalatok"])
+        self.assertIsNone(permit["felulvizsgalat_date"])
+        self.assertIsNone(permit["felulvizsgalatok"])
 
     def test_restore_replaces_wal_state(self):
         with self.db.get_connection() as conn:
@@ -99,3 +99,18 @@ class DatabaseTests(unittest.TestCase):
         with patch.object(self.db, "get_connection", side_effect=sqlite3.OperationalError("no such table")):
             with self.assertRaises(sqlite3.OperationalError):
                 self.db.get_changes("2026-01-01T12:00:00")
+
+    def test_incremental_query_uses_date_expression_index(self):
+        with self.db.get_connection() as conn:
+            plan = conn.execute(
+                "EXPLAIN QUERY PLAN SELECT * FROM engedelyek WHERE julianday(last_modified)>=julianday(?)",
+                ("2026-01-01T12:00:00",),
+            ).fetchall()
+        self.assertIn("idx_engedelyek_changes", " ".join(str(tuple(r)) for r in plan))
+
+    def test_foreign_keys_are_enforced_on_every_connection(self):
+        for _ in range(2):
+            with self.assertRaises(sqlite3.IntegrityError):
+                with self.db.get_connection() as conn:
+                    self.assertEqual(conn.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+                    conn.execute("INSERT INTO engedelyek (id, hatosag_id) VALUES ('bad', 999)")
