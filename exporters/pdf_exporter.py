@@ -18,12 +18,11 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.units import cm
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Optional, Dict, List
-import json
 
 from config.app_config import get_ordered_categories
-from utils.dates import compute_review_date
+from utils.dates import extract_review_entries as _extract_review_entries
 
 
 def footer_only(canvas, doc):
@@ -59,81 +58,6 @@ def _format_hatya(e: dict) -> str:
     if ht == "indefinite" or (not ht and e.get("hatarozatlan")):
         return "Határozatlan"
     return "Változtatásig"
-
-
-def _extract_review_entries(e: dict) -> List[tuple]:
-    """
-    Return list of (dateobj, note) sorted, unique by date.
-    Fallback order: felulvizsgalatok (JSON/list) -> felulvizsgalat_date -> computed from nap -> compute_review_date
-    """
-    entries: List[tuple] = []
-    raw = e.get("felulvizsgalatok")
-    if raw:
-        try:
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(parsed, list):
-                for it in parsed:
-                    if isinstance(it, dict):
-                        d = it.get("date")
-                        note = (it.get("note") or "").strip()
-                        if d:
-                            try:
-                                dd = datetime.fromisoformat(d).date()
-                                entries.append((dd, note))
-                            except Exception:
-                                try:
-                                    dd = datetime.strptime(str(d), "%Y-%m-%d").date()
-                                    entries.append((dd, note))
-                                except Exception:
-                                    continue
-        except Exception:
-            entries = []
-
-    if not entries:
-        fv_single = e.get("felulvizsgalat_date")
-        if fv_single:
-            try:
-                dd = datetime.fromisoformat(fv_single).date()
-                entries.append((dd, ""))
-            except Exception:
-                try:
-                    dd = datetime.strptime(str(fv_single), "%Y-%m-%d").date()
-                    entries.append((dd, ""))
-                except Exception:
-                    pass
-
-    if not entries:
-        try:
-            fv_nap = int(e.get("felulvizsgalat_nap") or 0)
-        except Exception:
-            fv_nap = 0
-        lej = e.get("lejarat")
-        if fv_nap > 0 and lej:
-            try:
-                ld = datetime.fromisoformat(lej).date()
-            except Exception:
-                try:
-                    ld = datetime.strptime(str(lej), "%Y-%m-%d").date()
-                except Exception:
-                    ld = None
-            if ld:
-                comp = ld - timedelta(days=fv_nap)
-                entries.append((comp, f"{fv_nap} nappal a lejárat előtt (számított)"))
-
-    if not entries:
-        try:
-            fv = compute_review_date(e)
-            if fv:
-                entries.append((fv, ""))
-        except Exception:
-            pass
-
-    unique = {}
-    for dt, note in entries:
-        key = dt.isoformat()
-        if key not in unique:
-            unique[key] = (dt, note or "")
-    return [unique[k] for k in sorted(unique.keys())]
 
 
 # ----------------- Badge Flowable -----------------
@@ -395,7 +319,7 @@ def export_groups_pdf(path: str, groups: Dict[str, List[dict]], telephely_map: D
                         text_html = ( (e.get("megjegyzes") or "").replace("\n","<br/>") + "<br/>" + extra ) if e.get("megjegyzes") else extra
                         megj_cell = Paragraph(text_html, styles["c"])
                     else:
-                        pass
+                        megj_cell = [megj_cell, Paragraph(extra, styles["c"])]
 
             hat_text = (e.get("hatarozatszam") or "").replace("\n", " ")
             mh = (e.get("modosito_hat") or "").strip()

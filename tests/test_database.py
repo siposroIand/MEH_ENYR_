@@ -38,14 +38,14 @@ class DatabaseTests(unittest.TestCase):
     def test_startup_does_not_backfill_or_modify_records(self):
         with self.db.get_connection() as conn:
             conn.execute(
-                "INSERT INTO engedelyek (id, hataly_tipus, lejarat, felulvizsgalat_nap) "
-                "VALUES ('permit', 'until_modified', '2030-12-31', 30)"
+                "INSERT INTO engedelyek (id, hataly_tipus, lejarat) "
+                "VALUES ('permit', 'until_modified', '2030-12-31')"
             )
         Database(self.db.db_path, self.db.backup_dir)
         permit = self.db.get_all_data()["engedelyek"][0]
         self.assertEqual(permit["hataly_tipus"], "until_modified")
         self.assertIsNone(permit["felulvizsgalat_date"])
-        self.assertIsNone(permit["felulvizsgalatok"])
+        self.assertEqual(permit["felulvizsgalatok"], "[]")
 
     def test_restore_replaces_wal_state(self):
         with self.db.get_connection() as conn:

@@ -113,6 +113,46 @@ class MainWindowSaveTests(unittest.TestCase):
         self.dialog._staging_dir.mkdir()
         (self.dialog._staging_dir / "permit.txt").write_text("attachment")
 
+    def test_register_permit_type_from_settings_without_saving_a_permit(self):
+        with patch("gui.main_window.QInputDialog.getText", return_value=("Új típus", True)):
+            self.window.add_permit_type()
+        self.assertIn("Új típus", self.window.get_category_suggestions())
+        self.assertEqual(self.window.data["engedelyek"], [])
+        self.assertEqual(self.window.db.get_catalogs()["engedelytipusok"][0]["nev"], "Új típus")
+
+    def test_invalid_permit_type_reports_error(self):
+        with patch("gui.main_window.QInputDialog.getText", return_value=(" ", True)), \
+                patch("gui.main_window.error") as report:
+            self.window.add_permit_type()
+        report.assert_called_once()
+        self.assertEqual(self.window.db.get_catalogs()["engedelytipusok"], [])
+
+    def test_normalized_details_are_visible_in_form_and_review_list(self):
+        data = {
+            "telephely_id": "site", "kategoria": "Hulladékgazdálkodási engedély",
+            "hatarozatszam": "123", "hataly_tipus": "fixed", "lejarat": "2030-12-31",
+            "modositok": ["MOD/1", "MOD;2"], "hulladek_nv_elokez": "1,5 kg",
+            "felulvizsgalatok": [
+                {"type": "date", "date": "2028-01-02", "note": "Explicit"},
+                {"type": "before_expiry", "days": 30, "note": "Relative30"},
+                {"type": "before_expiry", "days": 60, "note": "Relative60"},
+            ],
+        }
+        self.window.db.save_permit(data, "normalized", "2026-01-01")
+        self.window.refresh_data(incremental=False)
+        record = self.window.data["engedelyek"][0]
+        self.assertEqual(record["_fv_list"], [
+            (date(2028, 1, 2), "Explicit"), (date(2030, 11, 1), "Relative60"), (date(2030, 12, 1), "Relative30"),
+        ])
+        dialog = EngedelyDialog(
+            self.window, engedely=record, telephelyek=self.window.db.get_telephelyek(),
+            attachments_base=str(self.root / "attachments"),
+        )
+        self.addCleanup(dialog.deleteLater)
+        saved = dialog.get_data()
+        for key in ("modositok", "hulladek_nv_elokez", "felulvizsgalatok"):
+            self.assertEqual(saved[key], data[key])
+
     def test_new_ocr_values_are_immediately_displayed_and_searchable(self):
         with patch("gui.main_window.EngedelyDialog", return_value=self.dialog):
             with patch.object(self.dialog, "exec", return_value=QDialog.Accepted):
