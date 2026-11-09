@@ -1,11 +1,11 @@
 from typing import List, Dict, Any, Optional, Union
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import os
 import logging
 import re
 import math
-import json
+from utils.dates import extract_review_entries as _extract_review_entries
 from utils.fs_utils import unique_sheet_name
 
 logger = logging.getLogger(__name__)
@@ -148,76 +148,6 @@ def _render_str(v: Any) -> str:
         return str(v)
     except Exception:
         return ""
-
-def _extract_review_entries(e: dict) -> List[tuple]:
-    """
-    Shared extractor used by report_builder exporter.
-    """
-    entries: List[tuple] = []
-    raw = e.get("felulvizsgalatok")
-    if raw:
-        try:
-            parsed = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(parsed, list):
-                for it in parsed:
-                    if isinstance(it, dict):
-                        d = it.get("date")
-                        note = (it.get("note") or "").strip()
-                        if d:
-                            try:
-                                dd = datetime.fromisoformat(d).date()
-                                entries.append((dd, note))
-                            except Exception:
-                                try:
-                                    dd = datetime.strptime(str(d), "%Y.%m.%d").date()
-                                    entries.append((dd, note))
-                                except Exception:
-                                    continue
-        except Exception:
-            entries = []
-
-    if not entries:
-        fv_single = e.get("felulvizsgalat_date")
-        if fv_single:
-            try:
-                dd = datetime.fromisoformat(fv_single).date()
-                entries.append((dd, ""))
-            except Exception:
-                try:
-                    dd = datetime.strptime(str(fv_single), "%Y.%m.%d").date()
-                    entries.append((dd, ""))
-                except Exception:
-                    pass
-
-    if not entries:
-        try:
-            fv_nap = int(e.get("felulvizsgalat_nap") or 0)
-        except Exception:
-            fv_nap = 0
-        lejarat = e.get("lejarat")
-        if fv_nap > 0 and lejarat:
-            try:
-                ld = datetime.strptime(lejarat, "%Y.%m.%d").date()
-                comp = ld - timedelta(days=fv_nap)
-                entries.append((comp, f"{fv_nap} nappal a lejárat előtt (számított)"))
-            except Exception:
-                pass
-
-    if not entries:
-        try:
-            from utils import compute_review_date
-            fv = compute_review_date(e)
-            if fv:
-                entries.append((fv, ""))
-        except Exception:
-            pass
-
-    unique = {}
-    for dt, note in entries:
-        key = dt.isoformat()
-        if key not in unique:
-            unique[key] = (dt, note or "")
-    return [unique[k] for k in sorted(unique.keys())]
 
 def _format_review_dates_only(e: dict, date_format: str = "%Y.%m.%d") -> str:
     entries = _extract_review_entries(e)

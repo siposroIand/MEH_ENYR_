@@ -15,9 +15,9 @@ import unicodedata
 SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 _LABEL = re.compile(
     r"(?i)\b(tárgy|targy|hatályos|hatalyos|érvényes|ervenyes|lejárat(?:a)?|lejarat(?:a)?|"
-    r"érvényesség(?:e|i ideje|i idő)?|ervenyesseg(?:e|i ideje|i ido)?|hatály(?:a)?|hataly(?:a)?)\s*:"
+    r"érvényesség(?:e|i ideje|i idő)?|ervenyesseg(?:e|i ideje|i ido)?|hatály(?:a)?|hataly(?:a)?)\s*[:：]"
 )
-_NEXT_FIELD = re.compile(r"^\s*[^:\n]{1,60}:\s*")
+_NEXT_FIELD = re.compile(r"^\s*[^:：\n]{1,60}[:：]\s*")
 _MONTHS = (
     "januar", "februar", "marcius", "aprilis", "majus", "junius",
     "julius", "augusztus", "szeptember", "oktober", "november", "december",
@@ -103,7 +103,10 @@ _DECISION = re.compile(
 def _issued_dates(text: str) -> set[date]:
     dates = set()
     for label in _ISSUED.finditer(_fold(text).replace("\f", "\n")):
-        for match in _DATE.finditer(label.group(1) or label.group(2)):
+        matches = list(_DATE.finditer(label.group(1) or label.group(2)))
+        if not matches:
+            return set()
+        for match in matches:
             try:
                 dates.add(_parse_date(match))
             except ValueError:
@@ -119,12 +122,19 @@ def _decision_number(text: str) -> tuple[str | None, list[str]]:
         match = _DECISION.match(_fold(line))
         if not match:
             continue
-        # Header folding must not shift offsets if another line contains e.g. ß.
-        value = line[len(line) - len(match.group(1)):].strip() if match.group(1) else ""
+        # Map the folded header offset back without altering the identifier (e.g. ß).
+        offset = 0
+        start = len(line)
+        for position, character in enumerate(line):
+            if offset >= match.start(1):
+                start = position
+                break
+            offset += len(_fold(character))
+        value = line[start:].strip()
         if not value and index + 1 < len(lines) and not _NEXT_FIELD.match(lines[index + 1]):
             value = lines[index + 1].strip()
         # Stop at another labelled header, but retain spaces/punctuation inside IDs.
-        value = re.split(r"\s+(?=[^\W\d_][^:\n]{1,30}:)", value)[0].strip()
+        value = re.split(r"\s+(?=[^\W\d_][^:：\n]{1,30}[:：])", value)[0].strip()
         if any(c.isdigit() for c in value) and len(value) <= 200:
             numbers.add(value)
     if len(numbers) > 1:
@@ -393,9 +403,13 @@ def read_document(
     def ocr(image) -> str:
         check_cancelled()
         with ImageOps.exif_transpose(image) as oriented:
-            with oriented.convert("RGB") as prepared:
-                prepared.thumbnail((3500, 3500))
-                return pytesseract.image_to_string(prepared, lang="hun", timeout=45)
+            oriented.thumbnail((3500, 3500), Image.Resampling.LANCZOS)
+            with oriented.convert("RGBA") as rgba, Image.new("RGBA", oriented.size, "white") as background:
+                with Image.alpha_composite(background, rgba) as opaque, ImageOps.grayscale(opaque) as grayscale:
+                    with ImageOps.autocontrast(grayscale) as prepared:
+                        text = pytesseract.image_to_string(prepared, lang="hun", timeout=45)
+        check_cancelled()
+        return text
 
     try:
         check_cancelled()
@@ -413,18 +427,23 @@ def read_document(
                         fields = extract_fields(text, rules)
                         # Covers scanned and mixed pages (e.g. a text footer over a scan).
                         has_images = any(page.get_objects(filter=[pdfium.raw.FPDF_PAGEOBJ_IMAGE]))
-                        if has_images and (not fields.subject or not fields.validity or not fields.decision_number):
+                        if not text.strip() or (has_images and (
+                            not fields.subject or not fields.validity or not fields.decision_number
+                        )):
                             scale = min(3, 3500 / max(page.get_size()))
                             try:
                                 with closing(page.render(scale=scale)) as bitmap:
                                     with bitmap.to_pil() as image:
                                         scanned_text = ocr(image)
+                            except DocumentReadCancelled:
+                                raise
                             except (OSError, RuntimeError) as exc:
                                 if not text.strip():
                                     raise
                                 warnings.append(f"A kép OCR-felismerése sikertelen: {exc}")
                             else:
-                                text = text + "\n\n" + scanned_text
+                                # Keep native and recognized blocks apart while sharing issue-date context.
+                                text = text + "\f" + scanned_text
                         texts.append(text)
         else:
             with Image.open(path) as image:
@@ -432,6 +451,8 @@ def read_document(
                     texts.append(ocr(frame))
         check_cancelled()
         fields = extract_fields("\f".join(texts), rules)
+        if not any((fields.subject, fields.validity, fields.decision_number)):
+            warnings.append("Nem sikerült egyértelmű engedélyadatot felismerni; az adatokat kézzel kell megadni.")
         return DocumentFields(
             fields.subject, fields.expiry, fields.validity,
             tuple(dict.fromkeys((*fields.warnings, *warnings))), fields.decision_number, fields.ambiguous_fields,

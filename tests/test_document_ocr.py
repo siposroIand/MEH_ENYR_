@@ -2,7 +2,7 @@ from datetime import date
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from core.document_ocr import (
     DocumentFields, DocumentReadCancelled, DocumentReadError,
@@ -57,6 +57,7 @@ class FieldExtractionTests(unittest.TestCase):
             "Érvényes: a kiadástól számított öt év",
             "Érvényes: kiadástól 5 évig\nKelt: 2021.01.01.\nKelt: 2022.01.01.",
             "Érvényes: kiadástól 5 évig\nKelt: 2021.02.30.",
+            "Érvényes: kiadástól 5 évig\nKelt: 2021.01.01.\nKelt: olvashatatlan",
             "Érvényes: jogerőre emelkedéstől számított 5 év\nKelt: 2021.01.01.",
             "Érvényes: kézhezvételtől számított 5 év\nKelt: 2021.01.01.",
             "Érvényes: 2021.01.01. napjától 5 évig",
@@ -79,6 +80,13 @@ class FieldExtractionTests(unittest.TestCase):
                     self.assertEqual(fields.decision_number, identifier)
         self.assertEqual(extract_fields("Ügyiratszám:\nPE/123/2026").decision_number, "PE/123/2026")
         self.assertEqual(extract_fields("Ügyiratszám PE/123/2026").decision_number, "PE/123/2026")
+        self.assertEqual(extract_fields("Ügyiratszám: Straße/123/2026").decision_number, "Straße/123/2026")
+
+    def test_fullwidth_colons_from_ocr(self):
+        fields = extract_fields("Tárgy： Próba\nHatározatszám： PE/123/2026\nÉrvényes： 2030.12.31.")
+        self.assertEqual(fields.subject, "Próba")
+        self.assertEqual(fields.decision_number, "PE/123/2026")
+        self.assertEqual(fields.expiry, date(2030, 12, 31))
 
     def test_ambiguous_numbers_and_validity_survive_file_merge(self):
         first = extract_fields("Határozatszám: 1/2026\nÜgyiratszám: 2/2026\nÉrvényes: 2030.01.01.\nHatályos: 2031.01.01.")
@@ -237,6 +245,26 @@ class DocumentReadingTests(unittest.TestCase):
         with self.assertRaises(DocumentReadCancelled):
             read_document(self.root / "file.pdf", lambda: True)
 
+    def test_real_ocr_transparent_low_contrast_and_exif_oriented_images(self):
+        from PIL import Image, ImageOps
+        image = self.make_image()
+        self.addCleanup(image.close)
+        with ImageOps.grayscale(image) as gray, ImageOps.invert(gray) as alpha:
+            with Image.new("RGBA", image.size, (0, 0, 0, 0)) as transparent:
+                transparent.putalpha(alpha)
+                transparent.save(self.root / "transparent.png")
+            with ImageOps.colorize(gray, (150, 150, 150), (190, 190, 190)) as low_contrast:
+                low_contrast.save(self.root / "low-contrast.png")
+        with image.transpose(Image.Transpose.ROTATE_90) as rotated:
+            exif = rotated.getexif()
+            exif[274] = 6
+            rotated.save(self.root / "rotated.jpg", exif=exif)
+        for filename in ("transparent.png", "low-contrast.png", "rotated.jpg"):
+            with self.subTest(filename=filename):
+                fields = read_document(self.root / filename)
+                self.assertEqual(fields.subject, "Hulladékgazdálkodási engedély")
+                self.assertEqual(fields.expiry, date(2030, 12, 31))
+
     def test_corrupt_document(self):
         path = self.root / "corrupt.pdf"
         path.write_bytes(b"not a pdf")
@@ -265,6 +293,83 @@ class DocumentReadingTests(unittest.TestCase):
             fields = read_document(path, rules=rules)
         self.assertEqual(fields.subject, "próba")
         self.assertEqual(fields.expiry, date(2030, 12, 31))
+
+    def make_mixed_pdf(self, text="Tárgy: Próba"):
+        import reportlab
+        from reportlab.lib.utils import ImageReader
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.pdfgen.canvas import Canvas
+        pdfmetrics.registerFont(TTFont("MixedOCR", str(Path(reportlab.__file__).parent / "fonts/Vera.ttf")))
+        image = self.make_image()
+        self.addCleanup(image.close)
+        path = self.root / "mixed.pdf"
+        canvas = Canvas(str(path))
+        canvas.setFont("MixedOCR", 16)
+        canvas.drawString(30, 780, text)
+        canvas.drawImage(ImageReader(image), 30, 100, width=500, height=150)
+        canvas.save()
+        return path
+
+    def test_mixed_pdf_cancellation_is_not_swallowed_as_ocr_error(self):
+        path = self.make_mixed_pdf()
+        cancelled = Mock(side_effect=[False, False, True, False])
+        with patch("pytesseract.image_to_string") as recognize:
+            with self.assertRaises(DocumentReadCancelled):
+                read_document(path, cancelled)
+        recognize.assert_not_called()
+
+    def test_mixed_pdf_keeps_native_and_scanned_field_boundaries(self):
+        path = self.make_mixed_pdf("Tárgy:")
+        with patch("pytesseract.image_to_string", return_value="Nem tárgymező\nÉrvényes: 2030.12.31."):
+            fields = read_document(path)
+        self.assertIsNone(fields.subject)
+        self.assertEqual(fields.expiry, date(2030, 12, 31))
+
+    def test_mixed_pdf_native_text_survives_timeout_with_warning(self):
+        path = self.make_mixed_pdf()
+        with patch("pytesseract.image_to_string", side_effect=RuntimeError("OCR timeout")):
+            fields = read_document(path)
+        self.assertEqual(fields.subject, "Próba")
+        self.assertTrue(any("timeout" in warning for warning in fields.warnings))
+
+    def test_vector_only_pdf_also_uses_ocr(self):
+        from reportlab.pdfgen.canvas import Canvas
+        path = self.root / "vector.pdf"
+        canvas = Canvas(str(path))
+        canvas.rect(40, 100, 300, 200)
+        canvas.save()
+        with patch("pytesseract.image_to_string", return_value="Tárgy: Görbévé alakított szöveg") as recognize:
+            fields = read_document(path)
+        recognize.assert_called_once()
+        self.assertEqual(fields.subject, "Görbévé alakított szöveg")
+
+    def test_transparency_is_composited_on_white_before_ocr(self):
+        from PIL import Image
+        path = self.root / "transparent.png"
+        with Image.new("RGBA", (30, 30), (0, 0, 0, 0)) as image:
+            image.putpixel((15, 15), (0, 0, 0, 255))
+            image.save(path)
+
+        def recognize(image, **options):
+            self.assertEqual(image.mode, "L")
+            self.assertEqual(image.getpixel((0, 0)), 255)
+            self.assertEqual(image.getpixel((15, 15)), 0)
+            self.assertEqual(options, {"lang": "hun", "timeout": 45})
+            return ""
+
+        with patch("pytesseract.image_to_string", side_effect=recognize):
+            fields = read_document(path)
+        self.assertTrue(any("kézzel" in warning for warning in fields.warnings))
+
+    def test_cancel_after_engine_returns_discards_results(self):
+        image = self.make_image()
+        self.addCleanup(image.close)
+        path = self.root / "cancel.png"
+        image.save(path)
+        with patch("pytesseract.image_to_string", return_value="Tárgy: Próba"):
+            with self.assertRaises(DocumentReadCancelled):
+                read_document(path, Mock(side_effect=[False, False, True]))
 
 
 class CustomRuleTests(unittest.TestCase):

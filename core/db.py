@@ -12,9 +12,10 @@ import time
 from typing import Any, Optional
 
 from utils.fs_utils import create_lockfile, release_lockfile
+from core.permit_details import DETAIL_COLUMNS, create_detail_schema, load_details, replace_details
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_RETRIES = 3
 RETRY_INTERVAL = 0.15
 
@@ -25,20 +26,12 @@ PERMIT_COLUMNS = {
     "engedelytipus_id": "INTEGER REFERENCES engedelytipusok(id)",
     "hatosag_id": "INTEGER REFERENCES hatosagok(id)",
     "hatarozatszam": "TEXT",
-    "modosito_hat": "TEXT",
     "letrejott": "TEXT",
     "hatarozatlan": "INTEGER DEFAULT 0",
     "hatarozatlan_szoveg": "TEXT",
     "lejarat": "TEXT",
-    "felulvizsgalat_nap": "INTEGER",
-    "felulvizsgalat_date": "TEXT",
-    "felulvizsgalatok": "TEXT",
     "megjegyzes": "TEXT",
     "archivalt": "INTEGER DEFAULT 0",
-    "hulladek_nv_elokez": "TEXT",
-    "hulladek_v_elokez": "TEXT",
-    "hulladek_nv_gyujt": "TEXT",
-    "hulladek_v_gyujt": "TEXT",
     "last_modified": "TEXT",
     "deleted": "INTEGER DEFAULT 0",
     "hataly_tipus": "TEXT DEFAULT 'fixed'",
@@ -58,6 +51,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
         conn.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, nev TEXT NOT NULL UNIQUE CHECK(length(trim(nev)) > 0))")
     columns = ", ".join(f"{name} {definition}" for name, definition in PERMIT_COLUMNS.items())
     conn.execute(f"CREATE TABLE engedelyek ({columns})")
+    create_detail_schema(conn)
     for column in ("telephely_id", "hatosag_id", "engedelytipus_id"):
         conn.execute(f"CREATE INDEX idx_engedelyek_{column} ON engedelyek ({column})")
     conn.execute("CREATE INDEX idx_engedelyek_changes ON engedelyek (julianday(last_modified))")
@@ -67,7 +61,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
 
 def validate_schema(conn: sqlite3.Connection) -> None:
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-    expected = {"telephelyek", "engedelyek", "hatosagok", "engedelytipusok"}
+    expected = {"telephelyek", "engedelyek", "hatosagok", "engedelytipusok", *DETAIL_COLUMNS}
     if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION or tables != expected:
         raise sqlite3.DatabaseError(
             "Régi vagy nem támogatott adatbázis. Zárja be az alkalmazást, majd futtassa: "
@@ -78,6 +72,7 @@ def validate_schema(conn: sqlite3.Connection) -> None:
         "engedelyek": set(PERMIT_COLUMNS),
         "hatosagok": {"id", "nev"},
         "engedelytipusok": {"id", "nev"},
+        **DETAIL_COLUMNS,
     }
     for table, columns in required.items():
         if {r[1] for r in conn.execute(f"PRAGMA table_info({table})")} != columns:
@@ -156,7 +151,9 @@ class Database:
             conn.execute("BEGIN")
             return {
                 "telephelyek": [dict(r) for r in conn.execute("SELECT * FROM telephelyek ORDER BY nev")],
-                "engedelyek": [dict(r) for r in conn.execute(PERMIT_SELECT + " WHERE e.deleted IS NULL OR e.deleted=0")],
+                "engedelyek": load_details(conn, [dict(r) for r in conn.execute(
+                    PERMIT_SELECT + " WHERE e.deleted IS NULL OR e.deleted=0"
+                )]),
                 **self.get_catalogs(conn),
             }
 
@@ -179,9 +176,40 @@ class Database:
         if not since:
             return self.get_all_data()["engedelyek"]
         with self.get_connection() as conn:
-            return [dict(r) for r in conn.execute(
+            conn.execute("BEGIN")
+            return load_details(conn, [dict(r) for r in conn.execute(
                 PERMIT_SELECT + " WHERE julianday(e.last_modified) >= julianday(?)", (since,),
-            )]
+            )])
+
+    def add_permit_type(self, name: str) -> int:
+        with self.get_connection() as conn:
+            identifier = lookup_id(conn, "engedelytipusok", name)
+            if identifier is None:
+                raise ValueError("Az engedélytípus neve nem lehet üres.")
+            return identifier
+
+    def save_permit(self, data: dict, entity_id: str, now: str, updating: bool = False) -> None:
+        columns = [column for column in PERMIT_COLUMNS if column not in (
+            "id", "archivalt", "deleted", "hatarozatlan_szoveg",
+        )]
+        values = {**data, "last_modified": now}
+        with self.get_connection() as conn:
+            values["engedelytipus_id"] = lookup_id(conn, "engedelytipusok", data.get("kategoria"))
+            values["hatosag_id"] = lookup_id(conn, "hatosagok", data.get("kiado_hatosag"))
+            parameters = [values.get(column) for column in columns]
+            if updating:
+                assignments = ", ".join(f"{column}=?" for column in columns)
+                cursor = conn.execute(
+                    f"UPDATE engedelyek SET {assignments} WHERE id=? AND COALESCE(deleted, 0)=0",
+                    (*parameters, entity_id),
+                )
+                if cursor.rowcount != 1:
+                    raise sqlite3.IntegrityError("Az engedélyt időközben törölték; a módosítás nem menthető.")
+            else:
+                names = ", ".join(("id", *columns))
+                placeholders = ", ".join("?" for _ in range(len(columns) + 1))
+                conn.execute(f"INSERT INTO engedelyek ({names}) VALUES ({placeholders})", (entity_id, *parameters))
+            replace_details(conn, entity_id, data)
 
     def _backup_lock_path(self) -> Path:
         return self.backup_dir / (self.db_path.name + ".backup.lock")

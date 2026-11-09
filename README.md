@@ -84,6 +84,16 @@ hibás dokumentum vagy időtúllépés esetén a csatolmány megmarad és az ada
 kézzel is megadhatók. Az OCR időkorlátja képenként 45 másodperc; megszakításkor
 az aktuális felismerés befejezését megvárja, az ablak közben válaszképes marad.
 
+A képfeldolgozás figyelembe veszi az EXIF-tájolást, az átlátszó hátteret
+fehérre helyezi, és szürkeárnyalatos kontrasztjavítást végez. A PDF
+olvasható szövegrétegét továbbra is közvetlenül használja; szövegréteg nélküli,
+akár görbévé alakított szöveget tartalmazó oldalon is megpróbálja az OCR-t.
+A vegyes PDF szövegrétege és felismert képszövege külön blokk marad,
+így egy üres mező nem veszi át a másik blokk szövegét. OCR-hibánál a
+meglévő szövegréteg eredménye figyelmeztetéssel megmarad; megszakításkor
+nem alkalmaz részleges eredményt. Eredménytelen felismerésnél külön
+figyelmeztetés jelenik meg.
+
 ### Saját OCR-szabályok
 
 A főablak **Beállítások → OCR-szabályok…** menüje és az adatlap
@@ -122,19 +132,37 @@ hatóságnevekből kínál kiegészítést. Az új nevek az engedéllyel együtt
 egyetlen tranzakcióban kerülnek a törzstáblákba; hibás mentés nem hagy
 félkész törzsadatot.
 
+A **Beállítások → Új engedélytípus…** menüponttal engedély rögzítése nélkül
+is bővíthető a közös típuslista. A név szélső szóközeit levágja, az azonos
+nevet újrafelhasználja, üres nevet nem enged menteni.
+
 ## Adatbázis és átállás a régi verzióról
 
-Az új SQLite-adatbázis pontosan négy táblát tartalmaz:
+Az új SQLite-adatbázis sémaverziója **2** (`PRAGMA user_version`), és hét
+üzleti táblát tartalmaz:
 
 | Tábla | Tartalom |
 |---|---|
 | `telephelyek` | Telephelyek, KTJ és cím |
-| `engedelyek` | Engedélyadatok, hatály, felülvizsgálatok, hulladékadatok |
+| `engedelyek` | Engedély-alapadatok, hatály, megjegyzés, archiválás és törlési állapot |
 | `hatosagok` | Egyedi hatóságnevek |
 | `engedelytipusok` | Egyedi engedélytípusok/kategóriák |
+| `felulvizsgalatok` | Engedélyenként több dátumos vagy lejárathoz viszonyított felülvizsgálat, megjegyzéssel |
+| `modosito_hatarozatok` | Engedélyenként több módosító határozat, eredeti sorrendben |
+| `hulladekadatok` | Engedélyenként és hulladéktevékenységenként külön mennyiség és mértékegység |
 
 Az engedélyek idegen kulccsal hivatkoznak a telephelyre, a hatóságra és az
 engedélytípusra. A kapcsolatok ellenőrzése minden kapcsolaton aktív.
+A három részlettábla az engedélyhez kapcsolódik; fizikai engedélytörléskor
+a részletek is törlődnek, archiváláskor és logikai törléskor megmaradnak.
+A részletek nem szerepelnek párhuzamos JSON- vagy összefűzött oszlopokban
+az engedélytáblában. Az alapadatok és részletek mentése közös tranzakció,
+olvasásuk közös adatbázis-pillanatképből, kötegelt lekérdezéssel történik.
+Az adatlap, a főlista és az exportok ugyanazokat az adatokat használják.
+A lejárathoz viszonyított felülvizsgálatok a mindenkori lejáratból számolódnak,
+nem rögzülnek a migráció napján kiszámított dátumra. Több ilyen bejegyzés
+és dátumos bejegyzés együtt is megjelenik; határozatlan vagy változtatásig
+érvényes engedélynél csak a konkrét dátumos felülvizsgálatok jelennek meg.
 A kapcsolatok és az időbélyeg szerinti részleges frissítés indexeltek;
 az alkalmazás indításkor nem végez teljes táblás adatjavítást.
 Foglalt adatbázisnál a SQLite zárolásvárakozási időkorlátja 2 másodperc, az
@@ -147,6 +175,10 @@ hibával leáll, nem módosítja a fájlt. Az egyszeri konvertálást a projekt
 gyökerében található **`convert_database.py`** végzi. A projektből futtatható,
 csak a Python standard könyvtárát és a projekt közös sémadefinícióját
 használja; a GUI/OCR csomagokat nem kell hozzá telepíteni.
+Mind az eredeti, törzstáblák nélküli **0-s**, mind a korábbi négytáblás
+**1-es** sémát közvetlenül a 2-esre alakítja. A már 2-es verziójú
+adatbázist nem migrálja újra; az alkalmazás későbbi indításai sem futtatják
+újra az átalakítást.
 
 1. Zárja be az alkalmazás összes példányát. Készítsen biztonsági mentést
    az adatbázisról és a csatolmánykönyvtárról.
@@ -163,9 +195,18 @@ használja; a GUI/OCR csomagokat nem kell hozzá telepíteni.
 A konvertáló új fájlt készít, meglévő célt nem ír felül. A mentett WAL-adatokat
 is beolvassa, megőrzi az engedély- és telephelyazonosítókat, az archivált és
 törölt engedélyeket, valamint a meglévő felülvizsgálatokat. A régi hiányzó
-hatály- és felülvizsgálati mezőket egyszer tölti fel. A hatóság- és
-kategórianevekről levágja a szélső szóközöket, az azonos neveket összevonja.
-Aktív engedély hiányzó telephelye, ismeretlen oszlop vagy sérült adatbázis
+hatálytípust egyszer tölti fel. Ha nincs felülvizsgálati JSON-lista,
+a régi dátumos és napszámos mezőkből külön bejegyzéseket készít; meglévő
+listánál az a mérvadó, beleértve a tudatosan kiürített `[]` listát is.
+A régi JSON-lista formázása nem, az értelmezett tartalma és sorrendje megmarad;
+a típus nélküli dátumbejegyzések `date` típust kapnak.
+A 0-s sémánál a hatóság- és kategórianevekről levágja a szélső szóközöket,
+az azonos neveket összevonja. Az 1-es sémánál a törzsazonosítókat és a még
+nem használt típusokat, hatóságokat is megőrzi. A hulladékmennyiségeknél a
+`t`/`kg` egységet külön oszlopba teszi; az egyéb régi szöveget változatlanul
+megőrzi, egység találgatása nélkül.
+Aktív engedély hiányzó telephelye, ismeretlen oszlop, hibás/ismeretlen
+felülvizsgálati adat vagy sérült adatbázis
 esetén leáll, kész célfájl nélkül. A korábban törölt engedély már nem létező
 telephelyhivatkozását figyelmeztetéssel kiüríti, az engedélyt megtartja.
 
@@ -176,6 +217,9 @@ támogatnia (például helyi NTFS vagy ext4); hálózati megosztás helyett
 A régi `db_events` eseménynapló a régi fájlban marad; az új alkalmazás
 eseményei a Python-naplóba kerülnek. Régi sémájú biztonsági mentést is előbb
 konvertálni kell, közvetlenül nem állítható vissza az új alkalmazásban.
+A konvertáló mind a hét tábla rekordszámát kiírja; hibánál nem marad
+félkész céladatbázis, a forrás változatlan marad. Visszaálláshoz a régi
+alkalmazásverziót a megőrzött régi adatbázissal együtt kell használni.
 
 ## Fájlok megnyitása
 

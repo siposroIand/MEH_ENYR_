@@ -14,10 +14,9 @@ import shutil
 import sqlite3
 import logging
 import shlex
-import json
 import csv
 from uuid import uuid4
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Set
 
@@ -46,7 +45,7 @@ except Exception:
     OPENPYXL_AVAILABLE = False
 
 from config.app_config import get_ordered_categories
-from core.db import lookup_id
+from utils.dates import extract_review_entries
 from PySide6.QtWidgets import QToolTip
 from PySide6.QtGui import QFont
 
@@ -594,6 +593,7 @@ class MainWindow(QMainWindow):
         self.data: Dict[str, List[Dict[str, Any]]] = {"telephelyek": [], "engedelyek": []}
         settings_menu = self.menuBar().addMenu("Beállítások")
         settings_menu.addAction("OCR-szabályok…", lambda: OcrSettingsDialog(self).exec())
+        settings_menu.addAction("Új engedélytípus…", self.add_permit_type)
 
         # cache: attachments count per eng id
         self._attachments_cache: Dict[str, int] = {}
@@ -884,50 +884,7 @@ class MainWindow(QMainWindow):
                 # parsed date fields (lejárat)
                 e["_lej_dt"] = parse_dt_opt(e.get("lejarat"))
 
-                # New: support multiple felulvizsgalatok entries (JSON string or Python list)
-                fv_list_raw = e.get("felulvizsgalatok")
-                fv_pairs: List[tuple] = []
-                try:
-                    if fv_list_raw:
-                        if isinstance(fv_list_raw, str):
-                            parsed = json.loads(fv_list_raw)
-                        else:
-                            parsed = fv_list_raw
-                        if isinstance(parsed, list):
-                            for it in parsed:
-                                if isinstance(it, dict):
-                                    dt = parse_dt_opt(it.get("date"))
-                                    note = it.get("note") or ""
-                                    if dt:
-                                        fv_pairs.append((dt, note))
-                except Exception:
-                    logger.debug("Failed to parse felulvizsgalatok for %s", e.get("id"), exc_info=True)
-
-                # Backwards compatibility: if no explicit list, try single 'felulvizsgalat_date' OR computed from nap
-                if not fv_pairs:
-                    explicit = parse_dt_opt(e.get("felulvizsgalat_date"))
-                    if explicit:
-                        fv_pairs.append((explicit, ""))
-
-                # computed from nap if applicable (only meaningful if there is a lejarat)
-                fv_nap = int(e.get("felulvizsgalat_nap", 0) or 0)
-                if fv_nap > 0 and e.get("_lej_dt"):
-                    try:
-                        computed = e["_lej_dt"] - timedelta(days=fv_nap)
-                        # attach as computed with empty note; do not override explicit entries,
-                        # but include it as possible next review if no explicit earlier dates
-                        fv_pairs.append((computed, f"{fv_nap} nappal a lejárat előtt (számított)"))
-                    except Exception:
-                        pass
-
-                # unify: sort and keep unique dates (preserve notes for first occurrence)
-                unique = {}
-                for dt, note in fv_pairs:
-                    key = dt.isoformat()
-                    if key not in unique:
-                        unique[key] = {"date": dt, "note": note}
-                # produce list sorted by date
-                fv_list_sorted = [ (v["date"], v["note"]) for k, v in sorted(unique.items(), key=lambda kv: kv[0]) ]
+                fv_list_sorted = extract_review_entries(e)
 
                 # store machine-friendly structures for UI
                 e["_fv_list"] = fv_list_sorted  # list of (date, note)
@@ -1415,35 +1372,7 @@ class MainWindow(QMainWindow):
                 self._retry_permit_save(dlg, eng["id"], updating=True)
 
     def _persist_permit(self, data: Dict[str, Any], entity_id: str, now: str, updating: bool = False) -> None:
-        columns = (
-            "telephely_id", "engedely_nev", "engedelytipus_id", "hatosag_id",
-            "hatarozatszam", "modosito_hat", "letrejott", "hatarozatlan",
-            "lejarat", "hataly_tipus", "felulvizsgalat_nap", "felulvizsgalat_date",
-            "felulvizsgalatok", "megjegyzes", "hulladek_nv_elokez",
-            "hulladek_v_elokez", "hulladek_nv_gyujt", "hulladek_v_gyujt", "last_modified",
-        )
-        values = dict(data)
-        values["felulvizsgalatok"] = json.dumps(data.get("felulvizsgalatok", []), ensure_ascii=False)
-        values["last_modified"] = now
-        with self.db.get_connection() as conn:
-            values["engedelytipus_id"] = lookup_id(conn, "engedelytipusok", data.get("kategoria"))
-            values["hatosag_id"] = lookup_id(conn, "hatosagok", data.get("kiado_hatosag"))
-            parameters = [values.get(column) for column in columns]
-            if updating:
-                assignments = ", ".join(f"{column}=?" for column in columns)
-                cursor = conn.execute(
-                    f"UPDATE engedelyek SET {assignments} WHERE id=? AND COALESCE(deleted, 0)=0",
-                    (*parameters, entity_id),
-                )
-                if cursor.rowcount != 1:
-                    raise sqlite3.IntegrityError("Az engedélyt időközben törölték; a módosítás nem menthető.")
-            else:
-                names = ", ".join(("id", *columns))
-                placeholders = ", ".join("?" for _ in range(len(columns) + 1))
-                conn.execute(
-                    f"INSERT INTO engedelyek ({names}) VALUES ({placeholders})",
-                    (entity_id, *parameters),
-                )
+        self.db.save_permit(data, entity_id, now, updating)
 
     def _save_dialog_attachments(self, dialog: EngedelyDialog, entity_id: str) -> None:
         while True:
@@ -1678,6 +1607,19 @@ class MainWindow(QMainWindow):
             | {h["nev"] for h in self.data.get("hatosagok", [])}
         )
 
+    def add_permit_type(self) -> None:
+        name, accepted = QInputDialog.getText(self, "Új engedélytípus", "Engedélytípus neve:")
+        if not accepted:
+            return
+        try:
+            self.db.add_permit_type(name)
+        except (ValueError, sqlite3.Error) as exc:
+            logger.warning("Engedélytípus mentése sikertelen: %s", exc)
+            error(self, "Engedélytípus", str(exc))
+            return
+        self.refresh_data(incremental=False)
+        self.refresh_table()
+
     def get_category_suggestions(self) -> List[str]:
         existing = (
             {e["kategoria"] for e in self.data.get("engedelyek", []) if e.get("kategoria")}
@@ -1775,19 +1717,6 @@ class MainWindow(QMainWindow):
                 tp = next((t["nev"] for t in self.data.get("telephelyek", []) if t["id"] == e["telephely_id"]), "Ismeretlen")
                 rec = e.copy(); rec["telephely_nev"] = tp
                 review_all.append((rec, fv_dt, note))
-
-            # If no explicit entries but a computed fv (from felulvizsgalat_nap), include it (compat)
-            if not fv_list:
-                fv_nap = int(e.get("felulvizsgalat_nap", 0) or 0)
-                lejarat_date = e.get("_lej_dt")
-                if fv_nap > 0 and lejarat_date:
-                    try:
-                        computed = lejarat_date - timedelta(days=fv_nap)
-                        tp = next((t["nev"] for t in self.data.get("telephelyek", []) if t["id"] == e["telephely_id"]), "Ismeretlen")
-                        rec = e.copy(); rec["telephely_nev"] = tp
-                        review_all.append((rec, computed, f"{fv_nap} nappal a lejárat előtt (számított)"))
-                    except Exception:
-                        pass
 
         review_sorted = sorted(review_all, key=lambda it: it[1])
         if review_sorted:
